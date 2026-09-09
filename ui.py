@@ -2776,6 +2776,14 @@ class MainWindow(QMainWindow):
                           f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 4px;")
         lay.addWidget(hdr)
 
+        self._ai_provider_btn = QPushButton()
+        self._ai_provider_btn.setFixedHeight(30)
+        self._ai_provider_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._ai_provider_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._ai_provider_btn.clicked.connect(self._toggle_ai_provider)
+        lay.addWidget(self._ai_provider_btn)
+        self._update_ai_provider_btn()
+
         remote_btn = QPushButton("◉  REMOTE CONTROL")
         remote_btn.setFixedHeight(30)
         remote_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
@@ -2832,6 +2840,69 @@ class MainWindow(QMainWindow):
 
         w.adjustSize()
         return w
+
+    def _current_ai_provider(self) -> str:
+        provider = str(_read_full_config().get("ai_provider") or "gemini").strip().lower()
+        return "chatgpt" if provider in {"chatgpt", "openai", "gpt"} else "gemini"
+
+    def _openai_key_available(self) -> bool:
+        if (os.getenv("OPENAI_API_KEY") or "").strip():
+            return True
+        if (_read_full_config().get("openai_api_key") or "").strip():
+            return True
+        if platform.system() == "Darwin":
+            try:
+                r = subprocess.run(
+                    ["security", "find-generic-password", "-a", os.getenv("USER", ""),
+                     "-s", "DarkFlowJarvis-OpenAIAPIKey", "-w"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3,
+                )
+                return r.returncode == 0
+            except Exception:
+                pass
+        return False
+
+    def _update_ai_provider_btn(self) -> None:
+        if not hasattr(self, "_ai_provider_btn"):
+            return
+        provider = self._current_ai_provider()
+        chatgpt = provider == "chatgpt"
+        self._ai_provider_btn.setText("◈  AI BRAIN: " + ("CHATGPT" if chatgpt else "GEMINI"))
+        accent = C.GREEN if chatgpt else C.PRI
+        self._ai_provider_btn.setStyleSheet(
+            f"QPushButton {{ background:#00091a; color:{accent}; border:1px solid {accent}; "
+            "border-radius:3px; text-align:left; padding:0 8px; }}"
+            f"QPushButton:hover {{ background:{C.PRI_GHO}; }}"
+        )
+
+    def _toggle_ai_provider(self):
+        current = self._current_ai_provider()
+        target = "gemini" if current == "chatgpt" else "chatgpt"
+        if target == "chatgpt" and not self._openai_key_available():
+            self._log.append_log("SYS: OpenAI API key required — secure setup opened in Terminal.")
+            if platform.system() == "Darwin":
+                script = BASE_DIR / "setup_openai_key.sh"
+                try:
+                    cmd = f"zsh {script}"
+                    subprocess.Popen([
+                        "osascript",
+                        "-e", f'tell application "Terminal" to do script "{cmd}"',
+                        "-e", 'tell application "Terminal" to activate',
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception as exc:
+                    self._log.append_log(f"ERR: Could not open OpenAI key setup — {exc}")
+            return
+
+        cfg = _read_full_config()
+        cfg["ai_provider"] = target
+        try:
+            API_FILE.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
+        except Exception as exc:
+            self._log.append_log(f"ERR: Could not save AI provider — {exc}")
+            return
+        self._update_ai_provider_btn()
+        self._log.append_log(f"SYS: AI brain switched to {target.upper()} — restarting JARVIS...")
+        QTimer.singleShot(500, lambda: os._exit(0))
 
     def _toggle_drawer(self, checked: bool):
         if checked:

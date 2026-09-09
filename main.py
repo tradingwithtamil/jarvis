@@ -30,6 +30,7 @@ if _platform.system() == "Windows":
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import os
 import re
 import threading
 import time
@@ -91,6 +92,43 @@ CHUNK_SIZE          = 1024
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
+
+
+def _get_openai_api_key() -> str:
+    env_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if env_key:
+        return env_key
+    if sys.platform == "darwin":
+        try:
+            r = _subprocess.run(
+                ["security", "find-generic-password", "-a", os.getenv("USER", ""),
+                 "-s", "DarkFlowJarvis-OpenAIAPIKey", "-w"],
+                capture_output=True, text=True, timeout=3,
+            )
+            key = (r.stdout or "").strip()
+            if r.returncode == 0 and key:
+                return key
+        except Exception:
+            pass
+    try:
+        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return str(json.load(f).get("openai_api_key") or "").strip()
+    except Exception:
+        return ""
+
+
+def _get_ai_provider() -> str:
+    requested = (os.getenv("JARVIS_AI_PROVIDER") or "").strip().lower()
+    if not requested:
+        try:
+            with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+                requested = str(json.load(f).get("ai_provider") or "gemini").strip().lower()
+        except Exception:
+            requested = "gemini"
+    return "chatgpt" if requested in {"chatgpt", "openai", "gpt"} else "gemini"
+
+
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1").strip() or "gpt-realtime-2.1"
 
 
 def _load_system_prompt() -> str:
@@ -588,6 +626,8 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        self._provider = "gemini"                  # active AI brain for this process
+        self._force_gemini = False                 # safe fallback after OpenAI auth/config failure
 
         self._enhanced_live = True  # affective dialog + proactive audio; auto-disabled if the server rejects them
         _core_names = {t["name"] for t in TOOL_DECLARATIONS}
@@ -661,6 +701,11 @@ class JarvisLive:
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
+        if self._loop and self.session and hasattr(self.session, "cancel_response"):
+            try:
+                asyncio.run_coroutine_threadsafe(self.session.cancel_response(), self._loop)
+            except Exception:
+                pass
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -692,6 +737,52 @@ class JarvisLive:
         short = str(error)[:120]
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
+
+    def _build_openai_config(self) -> dict:
+        from core.openai_realtime_adapter import build_openai_tools
+
+        try:
+            cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read())
+            self._asst_name = (cfg.get("assistant_name") or "JARVIS").strip()
+        except Exception:
+            self._asst_name = "JARVIS"
+
+        memory = load_memory()
+        mem_str = format_memory_for_prompt(memory)
+        sys_prompt = _load_system_prompt()
+        now = datetime.now()
+        parts = [
+            "[CURRENT DATE & TIME]\nRight now it is: " + now.strftime("%A, %B %d, %Y — %I:%M %p"),
+            "[IDENTITY]\nYour name is " + self._asst_name + ". Always call the user 'BOSS'. Never call them sir. "
+            "When the user speaks Tanglish, reply in natural casual Tanglish. Keep technical terms in English.",
+        ]
+        if mem_str:
+            parts.append(mem_str)
+        parts.append(sys_prompt)
+        declarations = TOOL_DECLARATIONS + self._plugin_registry.get_tool_declarations()
+        return {
+            "type": "realtime",
+            "instructions": "\n\n".join(parts),
+            "output_modalities": ["audio"],
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "transcription": {"model": "gpt-4o-mini-transcribe"},
+                    "turn_detection": {
+                        "type": "semantic_vad", "eagerness": "medium",
+                        "create_response": True, "interrupt_response": True,
+                    },
+                    "noise_reduction": {"type": "far_field"},
+                },
+                "output": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "voice": "cedar",
+                },
+            },
+            "tools": build_openai_tools(declarations),
+            "tool_choice": "auto",
+            "max_output_tokens": 2048,
+        }
 
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
@@ -1487,20 +1578,32 @@ class JarvisLive:
 
         while True:
             try:
-                print("[JARVIS] Connecting...")
+                requested_provider = _get_ai_provider()
+                provider = "gemini" if self._force_gemini else requested_provider
+                openai_key = _get_openai_api_key() if provider == "chatgpt" else ""
+                if provider == "chatgpt" and not openai_key:
+                    provider = "gemini"
+                    self.ui.write_log("SYS: ChatGPT mode needs an OpenAI API key — Gemini fallback active.")
+                self._provider = provider
+                print(f"[JARVIS] Connecting ({provider})...")
                 self.ui.set_state("THINKING")
-                config = self._build_config()
 
-                # Fresh client on every reconnect — avoids stale HTTP session state
-                # v1alpha carries the enhanced audio features (affective dialog,
-                # proactive audio); if they get rejected we fall back to v1beta.
-                client = genai.Client(
-                    api_key=_get_api_key(),
-                    http_options={"api_version": "v1alpha" if self._enhanced_live else "v1beta"}
-                )
+                if provider == "chatgpt":
+                    from core.openai_realtime_adapter import OpenAIRealtimeSession
+                    config = self._build_openai_config()
+                    session_cm = OpenAIRealtimeSession(
+                        api_key=openai_key, model=OPENAI_REALTIME_MODEL, config=config
+                    )
+                else:
+                    config = self._build_config()
+                    client = genai.Client(
+                        api_key=_get_api_key(),
+                        http_options={"api_version": "v1alpha" if self._enhanced_live else "v1beta"}
+                    )
+                    session_cm = client.aio.live.connect(model=LIVE_MODEL, config=config)
 
                 async with (
-                    client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
+                    session_cm as session,
                     asyncio.TaskGroup() as tg,
                 ):
                     self.session          = session
@@ -1516,9 +1619,10 @@ class JarvisLive:
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
 
-                    print("[JARVIS] Connected.")
+                    print(f"[JARVIS] Connected ({provider}).")
                     self.ui.set_state("LISTENING")
-                    self.ui.write_log("SYS: JARVIS online.")
+                    brain = f"CHATGPT / {OPENAI_REALTIME_MODEL}" if provider == "chatgpt" else "GEMINI"
+                    self.ui.write_log(f"SYS: JARVIS online — {brain}.")
 
                     if self._dashboard:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
@@ -1554,7 +1658,7 @@ class JarvisLive:
 
                 # Enhanced audio features rejected by the server (preview API
                 # drift) — drop them and reconnect with the plain config.
-                if self._enhanced_live and (
+                if self._provider == "gemini" and self._enhanced_live and (
                     "INVALID_ARGUMENT" in err_str
                     or "affective" in err_str.lower()
                     or "proactiv" in err_str.lower()
@@ -1567,15 +1671,29 @@ class JarvisLive:
                     )
                     continue
 
-                # Invalid API key — stop hammering the API, prompt re-configuration
-                if "API key not valid" in err_str or "1007" in err_str:
-                    self.ui.write_log("ERR: API key invalid — please re-enter your key.")
+                # Invalid API key — ChatGPT safely falls back to Gemini for this process.
+                _err_low = err_str.lower()
+                _auth_error = (
+                    "api key not valid" in _err_low
+                    or "api_key_invalid" in _err_low
+                    or "invalid_api_key" in _err_low
+                    or "incorrect api key" in _err_low
+                    or "unauthenticated" in _err_low
+                    or "invalid api key" in _err_low
+                )
+                if _auth_error and self._provider == "chatgpt":
+                    self._force_gemini = True
+                    self.ui.write_log("ERR: OpenAI API key rejected — Gemini fallback active until restart.")
+                    await asyncio.sleep(0.5)
+                    continue
+                if self._provider == "gemini" and ("API key not valid" in err_str or "1007" in err_str):
+                    self.ui.write_log("ERR: Gemini API key invalid — please re-enter your key.")
                     self.ui.set_state("SLEEPING")
                     self.ui.prompt_reconfig()
                     while not self.ui._win._ready:
                         await asyncio.sleep(1)
-                    print("[JARVIS] New API key saved — reconnecting...")
-                    _conn_backoff = 3
+                    print("[JARVIS] New Gemini API key saved — reconnecting...")
+                    self._conn_backoff = 3
                     continue
 
                 # Network / timeout errors — log clearly and back off
