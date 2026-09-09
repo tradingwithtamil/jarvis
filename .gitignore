@@ -24,3 +24,6 @@ desktop.ini
 *.bak
 
 .env
+
+# Local paired mobile devices (contains bearer tokens)
+config/remote_devices.json

@@ -40,6 +40,7 @@ BASE_DIR    = Path(__file__).resolve().parent.parent
 STATIC_DIR  = Path(__file__).parent / "static"
 PORT        = 8000
 MAX_UPLOAD_MB = 500
+DEVICE_SESSIONS_PATH = BASE_DIR / "config" / "remote_devices.json"
 
 
 def _make_uploads_dir() -> Path:
@@ -467,12 +468,39 @@ class DashboardServer:
         self._wake_callback               = None
         self._connect_callback            = None
         self._pending_keys: dict[str, float] = {}
-        self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
+        self._device_sessions: dict[str, dict] = self._load_device_sessions()  # device_token → {session_key}
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
         self._uploads_dir                 = UPLOADS_DIR
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
         self.app                          = self._build_app()
+
+    # ── persistent paired devices ─────────────────────────────────────────
+
+    @staticmethod
+    def _load_device_sessions() -> dict[str, dict]:
+        try:
+            import json
+            data = json.loads(DEVICE_SESSIONS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): v for k, v in data.items() if isinstance(v, dict) and v.get("session_key")}
+        except Exception:
+            pass
+        return {}
+
+    def _save_device_sessions(self) -> None:
+        try:
+            import json, os as _os
+            DEVICE_SESSIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = DEVICE_SESSIONS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._device_sessions, indent=2), encoding="utf-8")
+            try:
+                _os.chmod(tmp, 0o600)
+            except Exception:
+                pass
+            tmp.replace(DEVICE_SESSIONS_PATH)
+        except Exception as exc:
+            print(f"[Dashboard] Could not persist paired devices: {exc}")
 
     # ── one-time key management ───────────────────────────────────────────
 
@@ -616,6 +644,7 @@ class DashboardServer:
             self._token_keys[tok] = key
             self._aes_key(key)
             self._device_sessions[dev_tok] = {"session_key": key}
+            self._save_device_sessions()
 
             if self._connect_callback:
                 self._connect_callback()
@@ -669,6 +698,7 @@ class DashboardServer:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             count = len(self._device_sessions)
             self._device_sessions.clear()
+            self._save_device_sessions()
             return JSONResponse({"ok": True, "revoked": count})
 
         @app.post("/api/command")
@@ -715,7 +745,7 @@ class DashboardServer:
                     data = await websocket.receive_bytes()
                     try:
                         self._phone_audio_queue.put_nowait(
-                            {"data": data, "mime_type": "audio/pcm"}
+                            {"data": data, "mime_type": "audio/pcm;rate=16000"}
                         )
                     except asyncio.QueueFull:
                         pass  # drop frame rather than block
