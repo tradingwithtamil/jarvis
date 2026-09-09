@@ -1681,6 +1681,18 @@ class JarvisLive:
                     or "unauthenticated" in _err_low
                     or "invalid api key" in _err_low
                 )
+                _credit_error = (
+                    "credit_balance_exhausted" in _err_low
+                    or "no credits remaining" in _err_low
+                    or "insufficient_quota" in _err_low
+                    or ("billing" in _err_low and "credit" in _err_low)
+                )
+                if _credit_error and self._provider == "chatgpt":
+                    self._force_gemini = True
+                    self.ui.write_log("ERR: OpenAI API credits unavailable — Gemini fallback active. Add API credits to use ChatGPT mode.")
+                    await asyncio.sleep(0.5)
+                    continue
+
                 if _auth_error and self._provider == "chatgpt":
                     self._force_gemini = True
                     self.ui.write_log("ERR: OpenAI API key rejected — Gemini fallback active until restart.")
