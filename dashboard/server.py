@@ -11,6 +11,7 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import os
 import re
 import secrets
 import socket
@@ -488,11 +489,17 @@ class DashboardServer:
         return (certs / "jarvis.key").exists() and (certs / "jarvis.crt").exists()
 
     def get_url(self) -> str:
+        remote = os.getenv("JARVIS_REMOTE_BASE_URL", "").strip().rstrip("/")
+        if remote:
+            return remote
         proto = "https" if self._ssl_enabled() else "http"
         return f"{proto}://{self._ip}:{PORT}"
 
     def get_manual_url(self) -> str:
-        """URL for manual browser entry. When HTTPS active, points to alias port (also HTTPS)."""
+        """URL shown for manual phone entry; prefer the secure tailnet URL when configured."""
+        remote = os.getenv("JARVIS_REMOTE_BASE_URL", "").strip().rstrip("/")
+        if remote:
+            return remote
         if self._ssl_enabled():
             return f"{self._ip}:{PORT + 1}"
         return f"{self._ip}:{PORT}"
