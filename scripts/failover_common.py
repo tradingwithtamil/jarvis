@@ -1,10 +1,13 @@
 from __future__ import annotations
 import hashlib, hmac, json, os, time
 from pathlib import Path
+import requests
 
 DEFAULT_ROOT = Path(os.getenv("JARVIS_VPS_ROOT", r"C:\JarvisVPS"))
 STATE_FILE = DEFAULT_ROOT / "state" / "failover.json"
 TOKEN_FILE = DEFAULT_ROOT / "secrets" / "failover.token"
+OLLAMA_URL = os.getenv("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("JARVIS_OLLAMA_MODEL", "llama3.2:latest")
 
 
 def read_token() -> str:
@@ -48,7 +51,17 @@ def heartbeat_age(state: dict) -> float:
         return 1e9
 
 
-def brain_key_present() -> bool:
+def local_ollama_ready() -> bool:
+    try:
+        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+        response.raise_for_status()
+        models = response.json().get("models") or []
+        return any((m.get("name") or m.get("model")) == OLLAMA_MODEL for m in models)
+    except Exception:
+        return False
+
+
+def brain_available() -> bool:
     if (os.getenv("OPENAI_API_KEY") or "").strip():
         return True
     if (os.getenv("GEMINI_API_KEY") or "").strip():
@@ -56,6 +69,12 @@ def brain_key_present() -> bool:
     api_file = DEFAULT_ROOT / "app" / "config" / "api_keys.json"
     try:
         cfg = json.loads(api_file.read_text(encoding="utf-8-sig"))
-        return bool(str(cfg.get("openai_api_key") or "").strip() or str(cfg.get("gemini_api_key") or "").strip())
+        if str(cfg.get("openai_api_key") or "").strip() or str(cfg.get("gemini_api_key") or "").strip():
+            return True
     except Exception:
-        return False
+        pass
+    return local_ollama_ready()
+
+
+def brain_key_present() -> bool:
+    return brain_available()
