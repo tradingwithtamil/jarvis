@@ -585,7 +585,10 @@ class JarvisLive:
         self._dashboard     = None
         self._briefing_sent    = False          # morning briefing fires once per process
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
-        self._proactive        = ProactiveEngine()
+        # Owner preference: JARVIS must never start talking on its own.
+        # Background checks may keep running, but voice output is user-initiated only.
+        self._unsolicited_voice_enabled = False
+        self._proactive        = ProactiveEngine(enabled=self._unsolicited_voice_enabled)
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
 
@@ -1327,6 +1330,9 @@ class JarvisLive:
             alert = await asyncio.to_thread(self._sys_monitor.check)
             if not alert or not self.session:
                 continue
+            if not self._unsolicited_voice_enabled:
+                self.ui.write_log(f"SYS: System alert (silent): {alert}")
+                continue
             # Don't interrupt an active conversation
             with self._speaking_lock:
                 speaking = self._is_speaking
@@ -1358,6 +1364,9 @@ class JarvisLive:
                         lang_e = memory.get("identity", {}).get("language", {})
                         lang   = (lang_e.get("value", "") if isinstance(lang_e, dict) else str(lang_e)).strip() or "English"
                         for alert in alerts:
+                            if not self._unsolicited_voice_enabled:
+                                self.ui.write_log(f"SYS: Monitor alert (silent): {alert}")
+                                continue
                             msg = (
                                 f"{alert}\n\n"
                                 f"Inform the user about this development naturally in {lang}. "
@@ -1384,6 +1393,8 @@ class JarvisLive:
         while True:
             await asyncio.sleep(60)   # evaluate once per minute
 
+            if not self._unsolicited_voice_enabled:
+                continue
             if not self.session:
                 continue
 
@@ -1534,7 +1545,7 @@ class JarvisLive:
                         tg.create_task(self._relay_phone_audio())
 
                     # Morning briefing — fires once per process launch (if enabled)
-                    if not self._briefing_sent and get_brief_enabled():
+                    if self._unsolicited_voice_enabled and not self._briefing_sent and get_brief_enabled():
                         self._briefing_sent = True
                         tg.create_task(self._send_startup_briefing())
 
