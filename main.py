@@ -40,10 +40,17 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-import sounddevice as sd
+_HEADLESS_BOOT = ("--headless" in sys.argv) or (os.getenv("JARVIS_HEADLESS", "").strip() == "1")
+
+if _HEADLESS_BOOT:
+    sd = None
+    JarvisUI = object
+else:
+    import sounddevice as sd
+    from ui import JarvisUI
+
 from google import genai
 from google.genai import types
-from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
     save_session_summary, pop_last_session,
@@ -74,6 +81,7 @@ from actions.background_monitor import (
 from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import get_brief_enabled
 from core.plugin_loader        import discover_plugins
+from scripts.mac_heartbeat    import start_mac_heartbeat
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -90,6 +98,9 @@ RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
 
 def _get_api_key() -> str:
+    env_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if env_key:
+        return env_key
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
 
@@ -600,8 +611,9 @@ TOOL_DECLARATIONS = [
 
 class JarvisLive:
 
-    def __init__(self, ui: JarvisUI):
+    def __init__(self, ui: JarvisUI, headless: bool = False):
         self.ui             = ui
+        self._headless      = headless
         self._asst_name     = "JARVIS"   # updated each session from config
         self.session              = None
         self.audio_in_queue       = None
@@ -1098,7 +1110,7 @@ class JarvisLive:
                                 self._turn_done_event.clear()
                             # Split into ~50 ms chunks so interrupt() stops audio within 50 ms
                             # (24000 Hz × 2 bytes/sample × 0.05 s = 2400 bytes per slice)
-                            _audio_data = response.data
+                            _audio_data = b"" if self._headless else response.data
                             _SLICE = 2400
                             for _i in range(0, len(_audio_data), _SLICE):
                                 self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
@@ -1639,9 +1651,11 @@ class JarvisLive:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
 
                     tg.create_task(self._send_realtime())
-                    tg.create_task(self._listen_audio())
+                    if not self._headless:
+                        tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
-                    tg.create_task(self._play_audio())
+                    if not self._headless:
+                        tg.create_task(self._play_audio())
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
@@ -1710,8 +1724,12 @@ class JarvisLive:
                     await asyncio.sleep(0.5)
                     continue
                 if self._provider == "gemini" and ("API key not valid" in err_str or "1007" in err_str):
-                    self.ui.write_log("ERR: Gemini API key invalid — please re-enter your key.")
+                    self.ui.write_log("ERR: Gemini API key invalid or missing.")
                     self.ui.set_state("SLEEPING")
+                    if self._headless:
+                        self._conn_backoff = 30
+                        await asyncio.sleep(self._conn_backoff)
+                        continue
                     self.ui.prompt_reconfig()
                     while not self.ui._win._ready:
                         await asyncio.sleep(1)
@@ -1749,7 +1767,49 @@ class JarvisLive:
             print(f"[JARVIS] Reconnecting in {delay}s...")
             await asyncio.sleep(delay)
 
+
+class HeadlessUI:
+    """Minimal UI adapter for VPS/background operation."""
+    def __init__(self):
+        self.muted = False
+        self.current_file = None
+        self.on_text_command = None
+        self.on_remote_clicked = None
+        self.on_interrupt = None
+        self.get_plugins = None
+        self.request_say = None
+
+    def write_log(self, message):
+        print(f"[JARVIS-HEADLESS] {message}", flush=True)
+
+    def set_state(self, state):
+        print(f"[JARVIS-HEADLESS] STATE={state}", flush=True)
+
+    def show_content(self, label, content):
+        print(f"[JARVIS-HEADLESS] CONTENT {label}: {str(content)[:500]}", flush=True)
+
+    def notify_phone_connected(self):
+        self.write_log("Phone/web client connected.")
+
+    def start_camera_stream(self):
+        self.write_log("Camera stream unavailable in VPS headless mode.")
+
+    def stop_camera_stream(self):
+        return None
+
+    def prompt_reconfig(self):
+        self.write_log("Set OPENAI_API_KEY or GEMINI_API_KEY on the VPS, then restart JARVIS.")
+
+
+def headless_main():
+    ui = HeadlessUI()
+    jarvis = JarvisLive(ui, headless=True)
+    asyncio.run(jarvis.run())
+
 def main():
+    heartbeat_started = start_mac_heartbeat(BASE_DIR)
+    if heartbeat_started:
+        print("[Failover] VPS heartbeat enabled for Mac primary.")
     ui = JarvisUI("face.png")
 
     def runner():
@@ -1764,4 +1824,7 @@ def main():
     ui.root.mainloop()
 
 if __name__ == "__main__":
-    main()
+    if _HEADLESS_BOOT:
+        headless_main()
+    else:
+        main()
