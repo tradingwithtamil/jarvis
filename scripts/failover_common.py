@@ -12,7 +12,7 @@ def read_token() -> str:
     if env:
         return env
     try:
-        return TOKEN_FILE.read_text(encoding="utf-8").strip()
+        return TOKEN_FILE.read_text(encoding="utf-8-sig").strip()
     except OSError:
         return ""
 
