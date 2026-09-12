@@ -7,7 +7,7 @@ from failover_common import DEFAULT_ROOT, STATE_FILE, atomic_json, brain_availab
 
 CHECK_SEC = int(os.getenv("JARVIS_FAILOVER_CHECK_SEC", "5"))
 STALE_SEC = int(os.getenv("JARVIS_FAILOVER_STALE_SEC", "45"))
-STARTUP_GRACE_SEC = int(os.getenv("JARVIS_FAILOVER_STARTUP_GRACE_SEC", "60"))
+STARTUP_GRACE_SEC = int(os.getenv("JARVIS_FAILOVER_STARTUP_GRACE_SEC", "20"))
 ENV_FILE = DEFAULT_ROOT / "secrets" / "jarvis.env"
 
 
