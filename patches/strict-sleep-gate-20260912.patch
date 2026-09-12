@@ -1,0 +1,250 @@
+diff --git a/main.py b/main.py
+index 77b072c..dd8ba1e 100644
+--- a/main.py
++++ b/main.py
+@@ -614,6 +614,19 @@ TOOL_DECLARATIONS = [
+     },
+ ]
+ 
++# Strict sleep is a real control tool so both ChatGPT text-brain and Gemini fallback
++# enter the exact same silent state when BOSS asks JARVIS to sleep.
++TOOL_DECLARATIONS.append({
++    "name": "sleep_jarvis",
++    "description": (
++        "Enter JARVIS strict sleep mode immediately. MUST use when BOSS says sleep, "
++        "go to sleep, sleep mode, or asks JARVIS to stop listening until wake. "
++        "After this tool is called, do not speak; only the owner phrase 'Wake up Jarvis' "
++        "or 'Jarvis wake up' may resume interaction."
++    ),
++    "parameters": {"type": "OBJECT", "properties": {}},
++})
++
+ class _TextBrainSessionFacade:
+     """Minimal session facade so non-audio JARVIS helpers remain compatible."""
+     def __init__(self, owner):
+@@ -662,6 +675,7 @@ class JarvisLive:
+         self.ui.on_text_command   = self._on_text_command
+         self.ui.on_remote_clicked = self._make_remote_key
+         self.ui.on_interrupt      = self.interrupt
++        self.ui.on_sleep          = self._enter_sleep_mode
+         self._turn_done_event: asyncio.Event | None = None
+         self._voice_turn_done_event: asyncio.Event | None = None
+         self._gemini_voice_queue: asyncio.Queue | None = None
+@@ -670,6 +684,7 @@ class JarvisLive:
+         self._last_user_turn_text = ""
+         self._hybrid_voice_mode = True  # ChatGPT brain + Gemini Live voice-only
+         self._human_conversation_mode = True
++        self._sleeping = False                    # hard sleep: wake phrase is the only unlock
+         self._speech_generation = 0
+         self._last_barge_in = 0.0
+         self._dashboard     = None
+@@ -721,8 +736,25 @@ class JarvisLive:
+         )
+         self._local_wake.start()
+ 
++    def _enter_sleep_mode(self) -> None:
++        """Hard sleep: stop speech and block all brain I/O until an owner wake phrase."""
++        if self._sleeping:
++            return
++        self._sleeping = True
++        self._pending_fallback_text = ""
++        print("[JARVIS] 💤 STRICT SLEEP — wake phrase only")
++        try:
++            self.interrupt()
++        except Exception:
++            pass
++        try:
++            self.ui.set_state("SLEEPING")
++            self.ui.write_log("SYS: Strict sleep active — say 'Wake up Jarvis' to resume.")
++        except Exception:
++            pass
++
+     def _on_owner_speech_start(self, score: float = 0.0) -> None:
+-        if not self._human_conversation_mode:
++        if self._sleeping or not self._human_conversation_mode:
+             return
+         with self._speaking_lock:
+             speaking = self._is_speaking
+@@ -738,6 +770,8 @@ class JarvisLive:
+             loop.call_soon_threadsafe(self.interrupt)
+ 
+     def _accept_owner_pcm(self, pcm: bytes) -> None:
++        if self._sleeping:
++            return
+         # ChatGPT text-brain mode transcribes complete owner utterances locally;
+         # only Gemini full-brain mode streams raw mic audio to a Live session.
+         if self._provider == "chatgpt" and self._text_brain_mode:
+@@ -758,6 +792,8 @@ class JarvisLive:
+                 loop.call_soon_threadsafe(_put, chunk)
+ 
+     def _on_owner_utterance(self, pcm: bytes, score: float = 0.0) -> None:
++        if self._sleeping:
++            return
+         if self._provider != "chatgpt" or not self._text_brain_mode or not pcm:
+             return
+         self._interrupted = False
+@@ -781,6 +817,8 @@ class JarvisLive:
+ 
+     def _queue_gemini_voice(self, text: str, user_context: str = "", forced_emotion: str | None = None) -> None:
+         """Thread-safe speech path with hidden human emotion/prosody directions."""
++        if self._sleeping:
++            return
+         text = str(text or "").strip()
+         if not text:
+             return
+@@ -828,14 +866,32 @@ class JarvisLive:
+         normalized = re.sub(r"[^a-z0-9]+", " ", str(transcript or "").lower()).strip()
+         if not normalized:
+             return False
+-        # Be tolerant of common speech-to-text variants while still requiring
+-        # the assistant name plus an intentional wake cue.
++        # In strict sleep, ONLY an explicit owner wake command unlocks JARVIS.
++        # While already awake, the broader hey/ok forms can still bring the window forward.
+         name = bool(re.search(r"\b(?:jarvis|jervis|jarves|jarviss)\b", normalized))
++        strict_wake = bool(re.search(
++            r"\b(?:wake\s+up\s+(?:jarvis|jervis|jarves|jarviss)|"
++            r"(?:jarvis|jervis|jarves|jarviss)\s+wake(?:\s+up)?)\b", normalized
++        ))
+         cue = bool(re.search(r"\b(?:wake|awake|hey|hello|hi|ok|okay)\b", normalized))
+-        direct = bool(re.search(r"\b(?:wake\s+up\s+(?:jarvis|jervis|jarves|jarviss)|(?:jarvis|jervis|jarves|jarviss)\s+wake(?:\s+up)?|hey\s+(?:jarvis|jervis|jarves|jarviss)|ok(?:ay)?\s+(?:jarvis|jervis|jarves|jarviss))\b", normalized))
+-        wake = direct or (name and cue)
++        broad_wake = bool(re.search(
++            r"\b(?:hey\s+(?:jarvis|jervis|jarves|jarviss)|"
++            r"ok(?:ay)?\s+(?:jarvis|jervis|jarves|jarviss))\b", normalized
++        )) or (name and cue)
++        wake = strict_wake if self._sleeping else (strict_wake or broad_wake)
+         if not wake:
+             return False
++        was_sleeping = self._sleeping
++        if was_sleeping:
++            self._sleeping = False
++            self._interrupted = False
++            self._speech_generation += 1
++            print("[JARVIS] ☀️ STRICT WAKE — owner phrase verified")
++            try:
++                self.ui.set_state("LISTENING")
++                self.ui.write_log("SYS: Owner wake phrase verified — JARVIS awake.")
++            except Exception:
++                pass
+         now = time.monotonic()
+         if now - self._last_wake_phrase < 2.0:
+             return True
+@@ -856,6 +912,8 @@ class JarvisLive:
+         exactly like a proactive check-in; Gemini phrases it naturally in the
+         user's language. Silently a no-op when no session is connected.
+         """
++        if self._sleeping:
++            return
+         loop = getattr(self, "_loop", None)
+         if self._provider == "chatgpt" and self._text_brain_mode:
+             self._queue_gemini_voice(str(instruction or ""), user_context=self._last_user_turn_text)
+@@ -894,6 +952,8 @@ class JarvisLive:
+         text = str(text or "").strip()
+         if not text or not self._loop:
+             return
++        if self._sleeping:
++            return
+         if self._provider == "chatgpt" and self._text_brain_mode and self._text_input_queue is not None:
+             asyncio.run_coroutine_threadsafe(self._enqueue_text_input(text, source="typed"), self._loop)
+             return
+@@ -952,6 +1012,8 @@ class JarvisLive:
+         self.ui.write_log("SYS: Interrupted — listening...")
+ 
+     def speak(self, text: str):
++        if self._sleeping:
++            return
+         text = str(text or "").strip()
+         if not text:
+             return
+@@ -1003,7 +1065,15 @@ class JarvisLive:
+ 
+     async def _enqueue_text_input(self, text: str, source: str = "voice") -> None:
+         text = _clean_transcript(str(text or "")).strip()
+-        if not text or self._text_input_queue is None:
++        if not text:
++            return
++        normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
++        if re.fullmatch(
++            r"(?:jarvis\s+)?(?:go\s+to\s+)?sleep(?:\s+mode)?(?:\s+jarvis)?", normalized
++        ):
++            self._enter_sleep_mode()
++            return
++        if self._sleeping or self._text_input_queue is None:
+             return
+         self._speech_generation += 1
+         self._last_user_turn_text = text
+@@ -1292,7 +1362,11 @@ class JarvisLive:
+         result = "Done."
+ 
+         try:
+-            if name == "open_app":
++            if name == "sleep_jarvis":
++                self._enter_sleep_mode()
++                result = "Strict sleep active. Do not speak until the owner wake phrase is verified."
++
++            elif name == "open_app":
+                 r = await loop.run_in_executor(None, lambda: open_app(parameters=args, response=None, player=self.ui))
+                 result = r or f"Opened {args.get('app_name')}."
+ 
+@@ -2066,6 +2140,8 @@ class JarvisLive:
+                 self._phone_active = False
+                 continue
+             self._phone_active = True   # phone is streaming — silence PC mic
++            if self._sleeping:
++                continue
+             if self._provider == "chatgpt" and self._text_brain_mode:
+                 data = chunk.get("data", b"") if isinstance(chunk, dict) else bytes(chunk)
+                 if data and not self.ui.muted:
+@@ -2093,6 +2169,8 @@ class JarvisLive:
+                 )
+                 if not text:
+                     continue
++                if self._sleeping:
++                    continue
+                 # Wait up to 8s for session to become ready after a wake
+                 for _ in range(80):
+                     if self.session:
+diff --git a/ui.py b/ui.py
+index 39e52fc..37d1e8e 100644
+--- a/ui.py
++++ b/ui.py
+@@ -1875,6 +1875,7 @@ class MainWindow(QMainWindow):
+         self.on_text_command   = None
+         self.on_remote_clicked = None   # callable: () -> (url, key) | None
+         self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
++        self.on_sleep          = None   # callable: () -> None — enter strict background sleep
+         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
+         self._muted            = False
+         self._current_file: str | None = None
+@@ -2035,10 +2036,15 @@ class MainWindow(QMainWindow):
+                 pass
+ 
+     def closeEvent(self, event) -> None:
+-        """Keep the assistant alive in the background so the wake phrase can restore it."""
++        """Hide JARVIS and enter strict sleep; only the owner wake phrase may restore it."""
+         if os.getenv("JARVIS_QUIT_ON_CLOSE", "").strip() == "1":
+             event.accept()
+             return
++        if callable(self.on_sleep):
++            try:
++                self.on_sleep()
++            except Exception as exc:
++                print(f"[UI] sleep callback failed: {exc}")
+         self.hide()
+         event.ignore()
+ 
+@@ -3539,6 +3545,14 @@ class JarvisUI:
+     def on_interrupt(self, cb):
+         self._win.on_interrupt = cb
+ 
++    @property
++    def on_sleep(self):
++        return self._win.on_sleep
++
++    @on_sleep.setter
++    def on_sleep(self, cb):
++        self._win.on_sleep = cb
++
+     @property
+     def get_plugins(self):
+         return self._win.get_plugins
