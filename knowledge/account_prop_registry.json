@@ -1,0 +1,65 @@
+{
+  "version": "1.0",
+  "policy": "metadata_only; live balances/status/rules must be refreshed",
+  "forex": {
+    "series": [
+      "Phase-1",
+      "Phase-2",
+      "Funded"
+    ],
+    "slots_per_series": 10,
+    "stable_rules": [
+      "same signal may route across configured phases",
+      "one-trade/duplicate/risk guards remain authoritative"
+    ],
+    "dynamic_fields": [
+      "firm targets",
+      "drawdown",
+      "minimum days",
+      "payout",
+      "current balance/equity",
+      "account lock/status"
+    ]
+  },
+  "futures": {
+    "series": [
+      "Challenge",
+      "Funded"
+    ],
+    "known_platforms": [
+      "CrossTrade",
+      "Tradovate"
+    ],
+    "firms_of_interest": [
+      "Apex",
+      "Lucid",
+      "Topstep",
+      "Tradeify",
+      "Blue Guardian"
+    ],
+    "dynamic_fields": [
+      "consistency",
+      "payout buffer",
+      "trailing/EOD drawdown",
+      "minimum days",
+      "current account state"
+    ]
+  },
+  "stocks": {
+    "dynamic_fields": [
+      "portfolio",
+      "MTF",
+      "orders",
+      "broker limits"
+    ]
+  },
+  "crypto": {
+    "dynamic_fields": [
+      "balances",
+      "open orders",
+      "fills",
+      "exchange limits"
+    ]
+  },
+  "rule": "Before risk/pass/payout decisions, verify current official firm/broker rules and live account source."
+}

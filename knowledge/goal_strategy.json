@@ -1,0 +1,11 @@
+{
+  "version": "1.0",
+  "goals": [
+    "Reliable Dark Flow automation across Forex, Futures, Stocks and Crypto",
+    "Source-proven lifecycle, risk and observability across specialist systems",
+    "JARVIS as human-like personal + CEO assistant with strong durable memory and safe tool use",
+    "Scalable prop-firm/account workflows without silent risk-rule violations",
+    "Low-noise self-healing, cost-efficient monitoring and rollback-safe deployment"
+  ],
+  "priority_rule": "BOSS latest explicit priority wins unless immediate safety/risk severity requires escalation."
+}

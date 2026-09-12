@@ -12,6 +12,7 @@ def get_base_dir() -> Path:
 
 
 SKILLS_DIR = get_base_dir() / "skills"
+KNOWLEDGE_DIR = get_base_dir() / "knowledge"
 
 
 def _parse_skill(path: Path) -> dict:
@@ -66,7 +67,20 @@ def search_skills(query: str, limit: int = 5) -> list:
     return [skill for _, skill in scored[: max(1, min(10, int(limit or 5)))]]
 
 
-def format_skill_index_for_prompt(max_chars: int = 3000) -> str:
+def load_constitution_for_prompt(max_chars: int = 6500) -> str:
+    path = KNOWLEDGE_DIR / "JARVIS_CONSTITUTION.md"
+    if not path.exists():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    return "[JARVIS CONSTITUTION — ALWAYS ON]\n" + text[:max_chars] + "\n"
+
+
+def format_skill_index_for_prompt(max_chars: int = 7000) -> str:
     skills = list_skills()
     if not skills:
         return ""

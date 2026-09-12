@@ -1,0 +1,56 @@
+{
+  "version": "1.0",
+  "policy": "metadata_only_no_secrets",
+  "nodes": {
+    "mac_primary": {
+      "role": "primary Jarvis voice/UI/mic/speaker and local assistant runtime"
+    },
+    "windows_vps": {
+      "role": "warm standby/failover, production support and emergency local Ollama brain"
+    },
+    "github": {
+      "role": "versioned source and recovery patches"
+    },
+    "make": {
+      "role": "selected webhook/router/automation scenarios; batch health checks to control credits"
+    },
+    "ceo_crm": {
+      "role": "cross-domain observability/control plane; not broker source truth"
+    }
+  },
+  "domains": {
+    "FOREX": {
+      "owner": "MT5 EA/series",
+      "execution": [
+        "TradingView/Telegram routing",
+        "MT5"
+      ],
+      "truth": "broker/MT5 + EA lifecycle"
+    },
+    "FUTURES": {
+      "owner": "futures specialist",
+      "execution": [
+        "TradingView",
+        "Make/router",
+        "CrossTrade",
+        "Tradovate"
+      ],
+      "truth": "Tradovate/fill lifecycle"
+    },
+    "STOCKS": {
+      "owner": "stocks specialist",
+      "execution": [
+        "broker API",
+        "portfolio/MTF"
+      ],
+      "truth": "broker portfolio/order source"
+    },
+    "CRYPTO": {
+      "owner": "crypto specialist",
+      "execution": [
+        "Binance/exchange lifecycle"
+      ],
+      "truth": "exchange order/fill lifecycle"
+    }
+  }
+}

@@ -56,6 +56,8 @@ from memory.memory_manager import (
     save_session_summary, pop_last_session,
 )
 
+from skills.skill_manager import format_skill_index_for_prompt, load_constitution_for_prompt
+
 from actions.file_processor import file_processor
 from actions.flight_finder     import flight_finder
 from actions.open_app          import open_app
@@ -751,7 +753,7 @@ class JarvisLive:
     def speak_error(self, tool_name: str, error: str):
         short = str(error)[:120]
         self.ui.write_log(f"ERR: {tool_name} — {short}")
-        self.speak(f"Sir, {tool_name} encountered an error. {short}")
+        self.speak(f"BOSS, {tool_name} encountered an error. {short}")
 
     def _build_openai_config(self) -> dict:
         from core.openai_realtime_adapter import build_openai_tools
@@ -773,6 +775,12 @@ class JarvisLive:
         ]
         if mem_str:
             parts.append(mem_str)
+        constitution = load_constitution_for_prompt()
+        if constitution:
+            parts.append(constitution)
+        skill_index = format_skill_index_for_prompt()
+        if skill_index:
+            parts.append(skill_index)
         parts.append(sys_prompt)
         declarations = TOOL_DECLARATIONS + self._plugin_registry.get_tool_declarations()
         return {
@@ -823,11 +831,9 @@ class JarvisLive:
             f"Use this to calculate exact times for reminders.\n\n"
         )
 
-        # Identity injection — overrides any hardcoded name in prompt.txt
-        _addr = (f"ADDRESS: Always call the user '{_user_name}'."
-                 if _user_name
-                 else "ADDRESS: When speaking Turkish → always say \"efendim\". "
-                      "When speaking English → say \"sir\". Never mix languages.")
+        # Identity injection — BOSS is the fixed owner address across providers.
+        _addr = ("ADDRESS: Always call the user 'BOSS'. Never call them sir. "
+                 "Default to natural Tamil/Tanglish; keep technical terms in English.")
         identity_ctx = (
             f"[IDENTITY]\n"
             f"Your name is {self._asst_name}. "
@@ -838,6 +844,12 @@ class JarvisLive:
         parts = [time_ctx, identity_ctx]
         if mem_str:
             parts.append(mem_str)
+        constitution = load_constitution_for_prompt()
+        if constitution:
+            parts.append(constitution)
+        skill_index = format_skill_index_for_prompt()
+        if skill_index:
+            parts.append(skill_index)
         parts.append(sys_prompt)
 
         cfg = dict(
