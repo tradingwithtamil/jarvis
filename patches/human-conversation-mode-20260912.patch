@@ -1,0 +1,299 @@
+--- a/main.py
++++ b/main.py
+@@ -635,6 +635,9 @@
+         self._pending_voice_text: list[dict] = []
+         self._last_user_turn_text = ""
+         self._hybrid_voice_mode = True  # ChatGPT brain + Gemini Live voice-only
++        self._human_conversation_mode = True
++        self._speech_generation = 0
++        self._last_barge_in = 0.0
+         self._dashboard     = None
+         self._briefing_sent    = False          # morning briefing fires once per process
+         self._unsolicited_voice_enabled = False   # never speak unless BOSS explicitly wakes/asks
+@@ -660,6 +663,8 @@
+         self._speaker_gate = SpeakerAudioGate(
+             self._voice_owner,
+             on_accept=self._accept_owner_pcm,
++            on_owner_speech_start=self._on_owner_speech_start,
++            on_owner_stream_pcm=self._accept_owner_pcm,
+             logger=lambda msg: (print(f"[Voice] {msg}"), self.ui.write_log(f"SYS: {msg}")),
+         )
+         self._speaker_gate.start()
+@@ -675,6 +680,22 @@
+             speaker_threshold=0.625,
+         )
+         self._local_wake.start()
++
++    def _on_owner_speech_start(self, score: float = 0.0) -> None:
++        if not self._human_conversation_mode:
++            return
++        with self._speaking_lock:
++            speaking = self._is_speaking
++        if not speaking:
++            return
++        now = time.monotonic()
++        if now - self._last_barge_in < 0.8:
++            return
++        self._last_barge_in = now
++        loop = getattr(self, "_loop", None)
++        if loop:
++            print(f"[JARVIS] 🛑 Owner barge-in verified score={score:.3f}")
++            loop.call_soon_threadsafe(self.interrupt)
+ 
+     def _accept_owner_pcm(self, pcm: bytes) -> None:
+         loop = getattr(self, "_loop", None)
+@@ -700,7 +721,7 @@
+         spoken = normalize_for_voice(text)
+         context = str(user_context or self._last_user_turn_text or "").strip()
+         payload, emotion = build_voice_message(spoken, context, forced_emotion)
+-        item = {"payload": payload, "emotion": emotion, "text": spoken}
++        item = {"payload": payload, "emotion": emotion, "text": spoken, "generation": self._speech_generation}
+         print(f"[GeminiVoice] queued emotion={emotion}")
+         loop = getattr(self, "_loop", None)
+         q = getattr(self, "_gemini_voice_queue", None)
+@@ -827,11 +848,19 @@
+     def interrupt(self) -> None:
+         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
+         self._interrupted = True
++        self._speech_generation += 1
+         if self._loop and self.session and hasattr(self.session, "cancel_response"):
+             try:
+                 asyncio.run_coroutine_threadsafe(self.session.cancel_response(), self._loop)
+             except Exception:
+                 pass
++        vq = self._gemini_voice_queue
++        if vq:
++            while True:
++                try:
++                    vq.get_nowait()
++                except Exception:
++                    break
+         q = self.audio_in_queue
+         if q:
+             drained = 0
+@@ -901,7 +930,7 @@
+                     "format": {"type": "audio/pcm", "rate": 24000},
+                     "transcription": {"model": "gpt-4o-mini-transcribe"},
+                     "turn_detection": {
+-                        "type": "semantic_vad", "eagerness": "medium",
++                        "type": "semantic_vad", "eagerness": "low",
+                         "create_response": True, "interrupt_response": True,
+                     },
+                     "noise_reduction": {"type": "far_field"},
+@@ -965,6 +994,17 @@
+             system_instruction="\n".join(parts),
+             tools=[{"function_declarations": TOOL_DECLARATIONS + self._plugin_registry.get_tool_declarations()}],
+             session_resumption=types.SessionResumptionConfig(),
++            realtime_input_config=types.RealtimeInputConfig(
++                automatic_activity_detection=types.AutomaticActivityDetection(
++                    disabled=False,
++                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
++                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
++                    prefix_padding_ms=300,
++                    silence_duration_ms=1100,
++                ),
++                activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
++                turn_coverage=types.TurnCoverage.TURN_INCLUDES_ALL_INPUT,
++            ),
+             # Sliding-window compression: session never dies from a full context
+             # window — JARVIS can stay in one conversation for hours
+             context_window_compression=types.ContextWindowCompressionConfig(
+@@ -1229,6 +1269,9 @@
+                         item = await self._gemini_voice_queue.get()
+                         payload = item.get("payload", "") if isinstance(item, dict) else str(item)
+                         emotion = item.get("emotion", "casual") if isinstance(item, dict) else "casual"
++                        generation = item.get("generation", self._speech_generation) if isinstance(item, dict) else self._speech_generation
++                        if generation != self._speech_generation:
++                            continue
+                         self._voice_turn_done_event.clear()
+                         print(f"[GeminiVoice] speaking emotion={emotion}")
+                         await voice_session.send_client_content(
+@@ -1242,8 +1285,9 @@
+                             if response.data:
+                                 data = response.data
+                                 total_audio += len(data)
+-                                for i in range(0, len(data), 2400):
+-                                    self.audio_in_queue.put_nowait(data[i:i + 2400])
++                                if generation == self._speech_generation:
++                                    for i in range(0, len(data), 2400):
++                                        self.audio_in_queue.put_nowait(data[i:i + 2400])
+                             sc = response.server_content
+                             if sc and sc.turn_complete:
+                                 got_turn_complete = True
+@@ -1280,9 +1324,12 @@
+         def callback(indata, frames, time_info, status):
+             with self._speaking_lock:
+                 jarvis_speaking = self._is_speaking
+-            if not jarvis_speaking and not self.ui.muted and not self._phone_active:
+-                data = indata.tobytes()
+-                self._speaker_gate.submit(data)
++            if self.ui.muted or self._phone_active:
++                return
++            data = indata.tobytes()
++            if jarvis_speaking and self._human_conversation_mode and not self._speaker_gate.enabled:
++                return
++            self._speaker_gate.submit(data)
+ 
+         try:
+             with sd.InputStream(
+@@ -1322,6 +1369,13 @@
+ 
+                     if response.server_content:
+                         sc = response.server_content
++
++                        if getattr(sc, "interrupted", False):
++                            self._interrupted = False
++                            out_buf = []
++                            if self._turn_done_event:
++                                self._turn_done_event.set()
++                            print("[JARVIS] 🛑 Server acknowledged interruption")
+ 
+                         if sc.output_transcription and sc.output_transcription.text:
+                             txt = _clean_transcript(sc.output_transcription.text)
+@@ -1343,9 +1397,9 @@
+                             # flag and skip all further processing for that turn.
+                             if self._interrupted:
+                                 self._interrupted = False
+-                                in_buf  = []
+                                 out_buf = []
+-                                continue
++                                if not in_buf:
++                                    continue
+ 
+                             full_in = " ".join(in_buf).strip()
+                             if full_in:
+@@ -1475,7 +1529,7 @@
+                 # thread-pool round-trips (was one asyncio.to_thread per 50ms slice).
+                 # Cap at ~200 ms so interrupt() still stops audio within ~200 ms.
+                 batch = bytearray(chunk)
+-                while len(batch) < 9600:   # 9600 bytes ≈ 200 ms at 24 kHz / 16-bit mono
++                while len(batch) < 3840:   # 3840 bytes ≈ 80 ms; faster human-like barge-in stop
+                     try:
+                         batch.extend(self.audio_in_queue.get_nowait())
+                     except asyncio.QueueEmpty:
+--- a/core/voice_owner.py
++++ b/core/voice_owner.py
+@@ -143,9 +143,11 @@
+ 
+ class SpeakerAudioGate:
+     """Segments mic PCM and forwards only verified owner utterances."""
+-    def __init__(self, verifier: OwnerVoiceVerifier, on_accept, logger=print):
++    def __init__(self, verifier: OwnerVoiceVerifier, on_accept, logger=print, on_owner_speech_start=None, on_owner_stream_pcm=None):
+         self.verifier = verifier
+         self.on_accept = on_accept
++        self.on_owner_speech_start = on_owner_speech_start or (lambda _score=0.0: None)
++        self.on_owner_stream_pcm = on_owner_stream_pcm or (lambda _pcm: None)
+         self.logger = logger or (lambda _msg: None)
+         self._q = queue.Queue(maxsize=320)
+         self._stop = threading.Event()
+@@ -155,6 +157,11 @@
+         self._segment = []
+         self._silence_chunks = 0
+         self._noise_rms = 120.0
++        self._owner_started_notified = False
++        self._segment_owner_verified = False
++        self._segment_owner_score = 0.0
++        self._barge_verify_attempts = 0
++        self._segment_streaming = False
+ 
+     @property
+     def enabled(self) -> bool:
+@@ -193,14 +200,26 @@
+         if not self._segment:
+             return
+         pcm = b"".join(self._segment)
++        early_ok = self._segment_owner_verified
++        early_score = self._segment_owner_score
++        was_streaming = self._segment_streaming
+         self._segment = []
+         self._active = False
+         self._silence_chunks = 0
++        self._owner_started_notified = False
++        self._segment_owner_verified = False
++        self._segment_owner_score = 0.0
++        self._barge_verify_attempts = 0
++        self._segment_streaming = False
++        if was_streaming:
++            self.logger(f"VOICE_OWNER: streamed owner utterance score={early_score:.3f}")
++            return
+         if len(pcm) < 16000 * 2:
+             return
+         ok, score = self.verifier.verify_pcm(pcm, 16000)
+-        if ok:
+-            self.logger(f"VOICE_OWNER: accepted score={score:.3f}")
++        if ok or early_ok:
++            best = max(score, early_score)
++            self.logger(f"VOICE_OWNER: accepted score={best:.3f}")
+             self.on_accept(pcm)
+         else:
+             self.logger(f"VOICE_OWNER: ignored non-owner score={score:.3f}")
+@@ -221,20 +240,49 @@
+                     self._active = True
+                     self._segment = list(self._preroll)
+                     self._silence_chunks = 0
++                    self._owner_started_notified = False
++                    self._segment_owner_verified = False
++                    self._segment_owner_score = 0.0
++                    self._barge_verify_attempts = 0
++                    self._segment_streaming = False
+                 else:
+                     self._noise_rms = 0.98 * self._noise_rms + 0.02 * max(20.0, rms)
+                 continue
+ 
++            was_streaming = self._segment_streaming
+             self._segment.append(data)
++            if was_streaming:
++                try:
++                    self.on_owner_stream_pcm(data)
++                except Exception:
++                    pass
++            if (not self._owner_started_notified and self._barge_verify_attempts < 4
++                    and len(self._segment) >= 12 and (len(self._segment) - 12) % 5 == 0):
++                self._barge_verify_attempts += 1
++                probe = b"".join(self._segment)
++                ok, score = self.verifier.verify_pcm(probe, 16000)
++                if ok:
++                    self._owner_started_notified = True
++                    self._segment_owner_verified = True
++                    self._segment_owner_score = score
++                    self.logger(f"VOICE_OWNER: barge-in verified score={score:.3f}")
++                    try:
++                        self.on_owner_speech_start(score)
++                    except Exception:
++                        pass
++                    self._segment_streaming = True
++                    try:
++                        self.on_owner_stream_pcm(probe)
++                    except Exception:
++                        pass
+             if speech:
+                 self._silence_chunks = 0
+             else:
+                 self._silence_chunks += 1
+ 
+             # Wait through natural speaking pauses before closing an utterance.
+-            # 14 x 64 ms ~= 900 ms. The old 7-chunk (~450 ms) cutoff split normal
+-            # sentences into fragments, causing owner re-verification failures and
+-            # leaving Gemini without a clean complete turn to answer.
+-            if self._silence_chunks >= 14 or len(self._segment) >= 188:
++            # 19 x 64 ms ~= 1.2 s, which feels more human and avoids cutting BOSS
++            # off during thinking pauses while still giving realtime VAD a clean tail.
++            if self._silence_chunks >= 19 or len(self._segment) >= 188:
+                 self._finish_segment()
+                 self._preroll.clear()
+--- a/core/prompt.txt
++++ b/core/prompt.txt
+@@ -82,3 +82,13 @@
+ Never read the [PROACTIVE_CHECK] tag aloud. Do NOT call any tools during a proactive check.
+ 
+ CRITICAL: Speak/take action immediately based on available info. Assume and proceed.
++
++
++[HUMAN CONVERSATION MODE]
++- Never talk over BOSS. If BOSS starts speaking while you are speaking, stop immediately and listen.
++- Let BOSS finish the full thought before replying. Treat short hesitations, filler words, and brief pauses as part of the same turn.
++- After BOSS finishes, respond naturally without repeating the whole request unless needed.
++- If BOSS says wait, hold on, one second, or equivalent Tamil/Tanglish wording, stay silent and keep listening.
++- If BOSS says stop, cancel the current spoken response. If BOSS says continue, resume only when the intended context is clear.
++- Use short acknowledgements sparingly. Avoid robotic confirmations and avoid interrupting with filler.
++- Prefer natural back-and-forth timing, concise spoken replies, and context-aware follow-ups.
