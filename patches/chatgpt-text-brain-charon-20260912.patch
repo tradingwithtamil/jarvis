@@ -1,0 +1,491 @@
+--- a/main.py
++++ b/main.py
+@@ -80,6 +80,13 @@
+ from core.slang_memory          import learn_from_text as learn_slang, prompt_context as slang_prompt_context, stats as slang_stats
+ from core.emotion_voice         import build_voice_message
+ from core.astra_brain           import ASTRA_MODEL, generate_final_text
++from core.local_stt             import LocalWhisperSTT
++from core.openai_text_brain     import (
++    TEXT_MODEL, build_response_tools, create_response,
++    extract_output_text as extract_text_brain_output,
++    extract_function_calls as extract_text_brain_calls,
++)
++from skills.skill_manager       import format_skill_index_for_prompt
+ 
+ def get_base_dir():
+     if getattr(sys, "frozen", False):
+@@ -606,7 +613,34 @@
+         }
+     },
+ ]
++
++class _TextBrainSessionFacade:
++    """Minimal session facade so non-audio JARVIS helpers remain compatible."""
++    def __init__(self, owner):
++        self.owner = owner
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, exc_type, exc, tb):
++        return False
++
++    async def send_client_content(self, turns=None, turn_complete=True):
++        text = ""
++        if isinstance(turns, dict):
++            for part in turns.get("parts") or []:
++                if isinstance(part, dict) and part.get("text"):
++                    text += (" " if text else "") + str(part.get("text"))
++        if text.strip():
++            await self.owner._enqueue_text_input(text.strip(), source="internal")
+ 
++    async def send_realtime_input(self, media=None):
++        return None
++
++    async def cancel_response(self):
++        return None
++
++
+ class JarvisLive:
+ 
+     def __init__(self, ui: JarvisUI):
+@@ -648,6 +682,11 @@
+         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+         self._provider = "gemini"                  # active AI brain for this process
+         self._force_gemini = False                 # safe fallback after OpenAI auth/config failure
++        self._text_brain_mode = True               # OpenAI text only; never OpenAI Realtime audio
++        self._text_input_queue: asyncio.Queue | None = None
++        self._stt_queue: asyncio.Queue | None = None
++        self._local_stt = LocalWhisperSTT()
++        self._pending_fallback_text = ""
+ 
+         self._enhanced_live = True  # affective dialog + proactive audio; auto-disabled if the server rejects them
+         _core_names = {t["name"] for t in TOOL_DECLARATIONS}
+@@ -665,6 +704,7 @@
+             on_accept=self._accept_owner_pcm,
+             on_owner_speech_start=self._on_owner_speech_start,
+             on_owner_stream_pcm=self._accept_owner_pcm,
++            on_owner_utterance=self._on_owner_utterance,
+             logger=lambda msg: (print(f"[Voice] {msg}"), self.ui.write_log(f"SYS: {msg}")),
+         )
+         self._speaker_gate.start()
+@@ -698,6 +738,10 @@
+             loop.call_soon_threadsafe(self.interrupt)
+ 
+     def _accept_owner_pcm(self, pcm: bytes) -> None:
++        # ChatGPT text-brain mode transcribes complete owner utterances locally;
++        # only Gemini full-brain mode streams raw mic audio to a Live session.
++        if self._provider == "chatgpt" and self._text_brain_mode:
++            return
+         loop = getattr(self, "_loop", None)
+         q = getattr(self, "out_queue", None)
+         if not loop or q is None or not pcm:
+@@ -713,6 +757,28 @@
+             if chunk:
+                 loop.call_soon_threadsafe(_put, chunk)
+ 
++    def _on_owner_utterance(self, pcm: bytes, score: float = 0.0) -> None:
++        if self._provider != "chatgpt" or not self._text_brain_mode or not pcm:
++            return
++        self._interrupted = False
++        loop = getattr(self, "_loop", None)
++        q = getattr(self, "_stt_queue", None)
++        if not loop or q is None:
++            return
++
++        def _put():
++            try:
++                q.put_nowait(bytes(pcm))
++                print(f"[LocalSTT] owner utterance queued bytes={len(pcm):,} score={score:.3f}")
++            except asyncio.QueueFull:
++                print("[LocalSTT] queue full — dropping oldest utterance")
++                try:
++                    q.get_nowait()
++                    q.put_nowait(bytes(pcm))
++                except Exception:
++                    pass
++        loop.call_soon_threadsafe(_put)
++
+     def _queue_gemini_voice(self, text: str, user_context: str = "", forced_emotion: str | None = None) -> None:
+         """Thread-safe speech path with hidden human emotion/prosody directions."""
+         text = str(text or "").strip()
+@@ -791,6 +857,9 @@
+         user's language. Silently a no-op when no session is connected.
+         """
+         loop = getattr(self, "_loop", None)
++        if self._provider == "chatgpt" and self._text_brain_mode:
++            self._queue_gemini_voice(str(instruction or ""), user_context=self._last_user_turn_text)
++            return
+         if not loop or not self.session:
+             return
+ 
+@@ -822,17 +891,22 @@
+         return url, key, f"{url}/auto-login?key={key}", manual
+ 
+     def _on_text_command(self, text: str):
+-        self._last_user_turn_text = str(text or "").strip()
++        text = str(text or "").strip()
++        if not text or not self._loop:
++            return
++        if self._provider == "chatgpt" and self._text_brain_mode and self._text_input_queue is not None:
++            asyncio.run_coroutine_threadsafe(self._enqueue_text_input(text, source="typed"), self._loop)
++            return
++        if not self.session:
++            return
++        self._last_user_turn_text = text
+         try:
+-            learn_slang(self._last_user_turn_text, source="typed")
++            learn_slang(text, source="typed")
+         except Exception as exc:
+             print(f"[SlangMemory] typed learn skipped: {exc}")
+-        if not self._loop or not self.session:
+-            return
+         asyncio.run_coroutine_threadsafe(
+             self.session.send_client_content(
+-                turns={"parts": [{"text": text}]},
+-                turn_complete=True
++                turns={"parts": [{"text": text}]}, turn_complete=True
+             ),
+             self._loop
+         )
+@@ -878,12 +952,17 @@
+         self.ui.write_log("SYS: Interrupted — listening...")
+ 
+     def speak(self, text: str):
++        text = str(text or "").strip()
++        if not text:
++            return
++        if self._provider == "chatgpt" and self._text_brain_mode:
++            self._queue_gemini_voice(text, user_context=self._last_user_turn_text)
++            return
+         if not self._loop or not self.session:
+             return
+         asyncio.run_coroutine_threadsafe(
+             self.session.send_client_content(
+-                turns={"parts": [{"text": text}]},
+-                turn_complete=True
++                turns={"parts": [{"text": text}]}, turn_complete=True
+             ),
+             self._loop
+         )
+@@ -892,7 +971,169 @@
+         short = str(error)[:120]
+         self.ui.write_log(f"ERR: {tool_name} — {short}")
+         self.speak(f"BOSS, {tool_name} encountered an error. {short}")
++
++    def _build_text_brain_instructions(self) -> str:
++        memory = load_memory()
++        mem_str = format_memory_for_prompt(memory)
++        skill_index = format_skill_index_for_prompt()
++        now = datetime.now().strftime("%A, %B %d, %Y — %I:%M %p")
++        parts = [
++            f"[CURRENT DATE & TIME]\nRight now it is: {now}",
++            "[IDENTITY]\nYou are JARVIS. Always call the user BOSS, never sir. "
++            "Default to natural spoken Tamil/Tanglish; keep technical terms in English.",
++            "[VOICE MODE]\nYou are the text-only reasoning brain. Local Whisper handles speech-to-text "
++            "and Gemini Live Charon speaks your final text. Do not discuss transport unless asked.",
++        ]
++        if mem_str:
++            parts.append(mem_str)
++        if skill_index:
++            parts.append(skill_index)
++        slang = slang_prompt_context()
++        if slang:
++            parts.append(slang)
++        parts.append(_load_system_prompt())
++        tanglish = tanglish_prompt_rules()
++        if tanglish:
++            parts.append(tanglish)
++        parts.append(
++            "Use tools for real actions and live facts. Never claim an action, trade, deploy, balance, "
++            "portfolio state, or API result unless the tool result proves it. Keep voice replies concise."
++        )
++        return "\n\n".join(parts)
++
++    async def _enqueue_text_input(self, text: str, source: str = "voice") -> None:
++        text = _clean_transcript(str(text or "")).strip()
++        if not text or self._text_input_queue is None:
++            return
++        self._speech_generation += 1
++        self._last_user_turn_text = text
++        self._last_user_speech = time.monotonic()
++        try:
++            learn_slang(text, source=source)
++        except Exception as exc:
++            print(f"[SlangMemory] {source} learn skipped: {exc}")
++        self.ui.write_log(f"You: {text}")
++        self._session_log.append(f"User: {text}")
++        if self._dashboard:
++            asyncio.create_task(self._dashboard.broadcast({
++                "type": "log", "speaker": "user", "text": text,
++                "ts": datetime.now().isoformat(),
++            }))
++        await self._text_input_queue.put((text, self._speech_generation))
++
++    async def _run_local_stt(self) -> None:
++        print(f"[LocalSTT] ready — faster-whisper/{self._local_stt.model_name}")
++        while True:
++            pcm = await self._stt_queue.get()
++            try:
++                text = await asyncio.to_thread(self._local_stt.transcribe_pcm, pcm, SEND_SAMPLE_RATE)
++            except Exception as exc:
++                print(f"[LocalSTT] failed: {exc}")
++                continue
++            text = _clean_transcript(text)
++            if not text:
++                continue
++            print(f"[LocalSTT] transcript: {text}")
++            await self._enqueue_text_input(text, source="voice")
++
++    async def _call_text_brain(self, user_text: str) -> str:
++        declarations = TOOL_DECLARATIONS + self._plugin_registry.get_tool_declarations()
++        tools = build_response_tools(declarations)
++        previous_turns = self._session_log[-10:-1] if len(self._session_log) > 1 else []
++        input_text = user_text
++        if previous_turns:
++            input_text = "[RECENT CONVERSATION]\n" + "\n".join(previous_turns) + \
++                         "\n\n[NEW USER REQUEST]\n" + user_text
++        response = await asyncio.to_thread(
++            create_response, _get_openai_api_key(),
++            instructions=self._build_text_brain_instructions(),
++            user_text=input_text, tools=tools,
++        )
++        vision_camera = False
++        for _round in range(8):
++            calls = extract_text_brain_calls(response)
++            if not calls:
++                answer = extract_text_brain_output(response)
++                if vision_camera:
++                    async def _close_cam():
++                        await asyncio.sleep(1.5)
++                        self.ui.stop_camera_stream()
++                    asyncio.create_task(_close_cam())
++                self._vision_busy = False
++                return answer.strip()
++            followup: list[dict] = []
++            for call in calls:
++                try:
++                    args = json.loads(call.get("arguments") or "{}")
++                except Exception:
++                    args = {}
++                fc = type("TextBrainCall", (), {})()
++                fc.id = call.get("call_id") or ""
++                fc.name = call.get("name") or ""
++                fc.args = args
++                fr = await self._execute_tool(fc)
++                result = getattr(fr, "response", {}) or {}
++                if isinstance(result, dict):
++                    result = result.get("result", result)
++                followup.append({
++                    "type": "function_call_output",
++                    "call_id": fc.id,
++                    "output": str(result),
++                })
++            if self._pending_vision:
++                import base64
++                img_b, mime_t, question, angle = self._pending_vision
++                self._pending_vision = None
++                vision_camera = vision_camera or angle == "camera"
++                data_url = f"data:{mime_t};base64,{base64.b64encode(img_b).decode('ascii')}"
++                followup.append({
++                    "role": "user",
++                    "content": [
++                        {"type": "input_image", "image_url": data_url},
++                        {"type": "input_text", "text": question},
++                    ],
++                })
++            response = await asyncio.to_thread(
++                create_response, _get_openai_api_key(),
++                instructions=self._build_text_brain_instructions(),
++                tools=tools, previous_response_id=str(response.get("id") or ""),
++                tool_outputs=followup,
++            )
++        raise RuntimeError("OpenAI text brain exceeded tool-call round limit")
+ 
++    async def _run_text_brain(self) -> None:
++        print(f"[TextBrain] ready — OpenAI Responses/{TEXT_MODEL}")
++        while True:
++            user_text, generation = await self._text_input_queue.get()
++            self.ui.set_state("THINKING")
++            try:
++                answer = await self._call_text_brain(user_text)
++            except Exception as exc:
++                low = str(exc).lower()
++                if any(k in low for k in ("credit", "quota", "billing", "api key", "401", "429")):
++                    self._pending_fallback_text = user_text
++                    self._force_gemini = True
++                    self.ui.write_log(
++                        "ERR: OpenAI text-brain credits/auth unavailable — switching to Gemini full-brain + Charon fallback."
++                    )
++                    raise RuntimeError(str(exc)) from exc
++                self.ui.write_log(f"ERR: ChatGPT text brain — {str(exc)[:180]}")
++                self._pending_fallback_text = user_text
++                raise
++            if generation != self._speech_generation:
++                print("[TextBrain] stale answer discarded after newer BOSS turn")
++                continue
++            if not answer:
++                continue
++            self.ui.write_log(f"{self._asst_name}: {answer}")
++            self._session_log.append(f"{self._asst_name}: {answer}")
++            if self._dashboard:
++                asyncio.create_task(self._dashboard.broadcast({
++                    "type": "log", "speaker": "jarvis", "text": answer,
++                    "ts": datetime.now().isoformat(),
++                }))
++            self._queue_gemini_voice(answer, user_context=user_text)
++
+     def _build_openai_config(self) -> dict:
+         from core.openai_realtime_adapter import build_openai_tools
+ 
+@@ -1825,6 +2066,11 @@
+                 self._phone_active = False
+                 continue
+             self._phone_active = True   # phone is streaming — silence PC mic
++            if self._provider == "chatgpt" and self._text_brain_mode:
++                data = chunk.get("data", b"") if isinstance(chunk, dict) else bytes(chunk)
++                if data and not self.ui.muted:
++                    self._speaker_gate.submit(data)
++                continue
+             with self._speaking_lock:
+                 speaking = self._is_speaking
+             if not speaking and not self.ui.muted:
+@@ -1852,10 +2098,12 @@
+                     if self.session:
+                         break
+                     await asyncio.sleep(0.1)
+-                if self.session:
++                if self._provider == "chatgpt" and self._text_brain_mode and self._text_input_queue is not None:
++                    await self._enqueue_text_input(text, source="web")
++                    self.ui.write_log(f"[Web]: {text}")
++                elif self.session:
+                     await self.session.send_client_content(
+-                        turns={"parts": [{"text": text}]},
+-                        turn_complete=True,
++                        turns={"parts": [{"text": text}]}, turn_complete=True,
+                     )
+                     self.ui.write_log(f"[Web]: {text}")
+                 else:
+@@ -1897,11 +2145,8 @@
+                 self.ui.set_state("THINKING")
+ 
+                 if provider == "chatgpt":
+-                    from core.openai_realtime_adapter import OpenAIRealtimeSession
+-                    config = self._build_openai_config()
+-                    session_cm = OpenAIRealtimeSession(
+-                        api_key=openai_key, model=OPENAI_REALTIME_MODEL, config=config
+-                    )
++                    # Text-only OpenAI brain. No OpenAI Realtime audio websocket is opened.
++                    session_cm = _TextBrainSessionFacade(self)
+                 else:
+                     config = self._build_config()
+                     client = genai.Client(
+@@ -1921,6 +2166,12 @@
+                     self._voice_turn_done_event = asyncio.Event()
+                     self._voice_turn_done_event.set()
+                     self._gemini_voice_queue = asyncio.Queue(maxsize=50)
++                    if provider == "chatgpt":
++                        self._text_input_queue = asyncio.Queue(maxsize=20)
++                        self._stt_queue = asyncio.Queue(maxsize=8)
++                    else:
++                        self._text_input_queue = None
++                        self._stt_queue = None
+ 
+                     # Reset transient state that must not carry over from a previous session
+                     self._pending_vision       = None
+@@ -1933,27 +2184,42 @@
+                     print(f"[JARVIS] Connected ({provider}).")
+                     self.ui.set_state("LISTENING")
+                     brain = (
+-                        f"CHATGPT / {OPENAI_REALTIME_MODEL} primary brain + GPT-6 ASTRA / {ASTRA_MODEL} fallback + GEMINI LIVE / Charon voice"
+-                        if provider == "chatgpt" and self._hybrid_voice_mode
+-                        else (f"CHATGPT / {OPENAI_REALTIME_MODEL}" if provider == "chatgpt" else "GEMINI")
++                        f"CHATGPT / {TEXT_MODEL} text brain + LOCAL WHISPER STT + GEMINI LIVE / Charon voice"
++                        if provider == "chatgpt"
++                        else "GEMINI full-brain + Charon fallback"
+                     )
+                     self.ui.write_log(f"SYS: JARVIS online — {brain}.")
+ 
+                     if self._dashboard:
+                         await self._dashboard.broadcast({"type": "status", "state": "active"})
+ 
+-                    tg.create_task(self._send_realtime())
+                     tg.create_task(self._listen_audio())
+-                    tg.create_task(self._receive_audio())
+                     tg.create_task(self._play_audio())
+-                    if provider == "chatgpt" and self._hybrid_voice_mode:
++                    if provider == "chatgpt":
++                        tg.create_task(self._run_local_stt())
++                        tg.create_task(self._run_text_brain())
+                         tg.create_task(self._run_gemini_voice_renderer())
++                    else:
++                        tg.create_task(self._send_realtime())
++                        tg.create_task(self._receive_audio())
+                     tg.create_task(self._run_system_monitor())
+                     tg.create_task(self._run_background_monitor())
+                     tg.create_task(self._run_proactive_mode())
+                     if self._dashboard:
+                         tg.create_task(self._relay_phone_audio())
+ 
++                    # Replay a user turn that triggered an OpenAI fallback/reconnect.
++                    if self._pending_fallback_text:
++                        pending = self._pending_fallback_text
++                        self._pending_fallback_text = ""
++                        if provider == "gemini":
++                            await self.session.send_client_content(
++                                turns={"parts": [{"text": pending}]}, turn_complete=True
++                            )
++                        elif self._text_input_queue is not None:
++                            self._speech_generation += 1
++                            await self._text_input_queue.put((pending, self._speech_generation))
++
+                     # Morning briefing — fires once per process launch (if enabled)
+                     if self._unsolicited_voice_enabled and not self._briefing_sent and get_brief_enabled():
+                         self._briefing_sent = True
+@@ -2053,6 +2319,8 @@
+                     self._conn_backoff = 3
+             finally:
+                 self.session = None
++                self._text_input_queue = None
++                self._stt_queue = None
+                 # Only save if there was a real conversation (≥3 turns)
+                 if len(self._session_log) >= 3:
+                     asyncio.create_task(self._save_session_summary())
+--- a/core/voice_owner.py
++++ b/core/voice_owner.py
+@@ -143,11 +143,12 @@
+ 
+ class SpeakerAudioGate:
+     """Segments mic PCM and forwards only verified owner utterances."""
+-    def __init__(self, verifier: OwnerVoiceVerifier, on_accept, logger=print, on_owner_speech_start=None, on_owner_stream_pcm=None):
++    def __init__(self, verifier: OwnerVoiceVerifier, on_accept, logger=print, on_owner_speech_start=None, on_owner_stream_pcm=None, on_owner_utterance=None):
+         self.verifier = verifier
+         self.on_accept = on_accept
+         self.on_owner_speech_start = on_owner_speech_start or (lambda _score=0.0: None)
+         self.on_owner_stream_pcm = on_owner_stream_pcm or (lambda _pcm: None)
++        self.on_owner_utterance = on_owner_utterance or (lambda _pcm, _score=0.0: None)
+         self.logger = logger or (lambda _msg: None)
+         self._q = queue.Queue(maxsize=320)
+         self._stop = threading.Event()
+@@ -213,6 +214,10 @@
+         self._segment_streaming = False
+         if was_streaming:
+             self.logger(f"VOICE_OWNER: streamed owner utterance score={early_score:.3f}")
++            try:
++                self.on_owner_utterance(pcm, early_score)
++            except Exception:
++                pass
+             return
+         if len(pcm) < 16000 * 2:
+             return
+@@ -221,6 +226,10 @@
+             best = max(score, early_score)
+             self.logger(f"VOICE_OWNER: accepted score={best:.3f}")
+             self.on_accept(pcm)
++            try:
++                self.on_owner_utterance(pcm, best)
++            except Exception:
++                pass
+         else:
+             self.logger(f"VOICE_OWNER: ignored non-owner score={score:.3f}")
+ 
