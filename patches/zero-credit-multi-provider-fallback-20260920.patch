@@ -1,0 +1,135 @@
+# JARVIS zero-credit multi-provider fallback — 2026-09-20
+# Runtime target: current Mac main.py.
+# Safety: fallback reasoning is read-only. No broker/order/risk/LIVE/ARM mutation.
+
+--- a/main.py
++++ b/main.py
+@@
+-from actions.web_search        import web_search as web_search_action
++from actions.web_search        import web_search as web_search_action, _ddg_search, _format_ddg
+@@
+         self._pending_fallback_text = ""
++        self._fallback_question_inflight = ""
++        self._gemini_blocked_until = 0.0
+@@
+-        if self._provider != "chatgpt" or not self._text_brain_mode or not pcm:
++        if self._provider not in {"chatgpt", "local"} or not self._text_brain_mode or not pcm:
+             return
+@@
+-            if self._provider == "chatgpt" and self._text_brain_mode:
++            if self._provider in {"chatgpt", "local"} and self._text_brain_mode:
+                 loop.call_soon_threadsafe(self._begin_barge_in, score)
+@@
+-        if self._provider == "chatgpt" and self._text_brain_mode:
++        if self._provider in {"chatgpt", "local"} and self._text_brain_mode:
+             return
+@@
+-        if self._provider == "chatgpt" and self._text_brain_mode:
++        if self._provider in {"chatgpt", "local"} and self._text_brain_mode:
+             asyncio.run_coroutine_threadsafe(self._enqueue_text_input(text, source="typed"), self._loop)
+@@
++        if self._provider == "local" and self._text_brain_mode:
++            if self._loop:
++                asyncio.run_coroutine_threadsafe(self._speak_mac_voice_fallback(text), self._loop)
++            return
+         if self._provider == "chatgpt" and self._text_brain_mode:
+             self._queue_gemini_voice(text, user_context=self._last_user_turn_text)
+@@
+-    async def _call_vps_ollama_brain_fallback(self, user_text: str) -> str:
++    async def _call_vps_ollama_brain_fallback(self, user_text: str, web_context: str = "") -> str:
+@@
++            "When WEB EVIDENCE is present, use it as supporting context and never invent facts beyond it.\n\n"
++            f"{shared_context}\n\nWEB EVIDENCE:\n{str(web_context or '')[:6500]}\n\n"
+@@
++    async def _call_zero_credit_fallback(self, user_text: str) -> str:
++        query = str(user_text or "").strip()
++        if not query:
++            return ""
++        self._activity("WORKING", "DDG + VPS fallback")
++        web_context = ""
++        try:
++            def _search_ddg():
++                rows = _ddg_search(query, max_results=8)
++                return _format_ddg(query, rows)
++            web_context = await asyncio.to_thread(_search_ddg)
++            if web_context.startswith("No results found"):
++                web_context = ""
++        except Exception as exc:
++            print(f"[ZeroCredit] DDG unavailable: {exc}")
++        try:
++            return await self._call_vps_ollama_brain_fallback(query, web_context=web_context)
++        except Exception as exc:
++            print(f"[ZeroCredit] VPS Ollama unavailable: {exc}")
++            if web_context:
++                return "BOSS, cloud AI credits unavailable. Web search result மட்டும் கிடைச்சிருக்கு; இதோ raw evidence:\n" + web_context[:5000]
++            return "BOSS, ChatGPT/Gemini credits or connection unavailable; DDG/VPS fallback-லும் இப்போ answer கிடைக்கலை."
+@@
+     async def _run_primary_health_monitor(self) -> None:
+         while True:
++            if self._provider == "local" and self._force_gemini:
++                gemini_remaining = float(self._gemini_blocked_until or 0.0) - time.time()
++                if gemini_remaining <= 0:
++                    self._gemini_blocked_until = 0.0
++                    raise RuntimeError("JARVIS_RETRY_GEMINI")
++                await asyncio.sleep(min(30.0, max(3.0, gemini_remaining)))
++                continue
+@@
+             answer = ""
++            if self._provider == "local":
++                answer = await self._call_zero_credit_fallback(user_text)
++            else:
++                # Existing OpenAI primary -> Gemini fallback logic.
++                ...
+@@
+-            self._queue_gemini_voice(answer, user_context=user_text)
++            if self._provider == "local":
++                await self._speak_mac_voice_fallback(answer)
++            else:
++                self._queue_gemini_voice(answer, user_context=user_text)
+@@
+-                provider = "gemini" if self._force_gemini else requested_provider
++                gemini_blocked = time.time() < float(self._gemini_blocked_until or 0.0)
++                provider = ("local" if self._force_gemini and gemini_blocked else
++                            "gemini" if self._force_gemini else requested_provider)
+@@
+-                if provider == "chatgpt":
++                if provider in {"chatgpt", "local"}:
+                     session_cm = _TextBrainSessionFacade(self)
+@@
+-                    if provider == "chatgpt":
++                    if provider in {"chatgpt", "local"}:
+                         self._text_input_queue = asyncio.Queue(maxsize=20)
+                         self._stt_queue = asyncio.Queue(maxsize=8)
+@@
+-                    if provider == "chatgpt":
++                    if provider in {"chatgpt", "local"}:
+                         tg.create_task(self._run_local_stt())
+                         tg.create_task(self._run_text_brain())
+-                        tg.create_task(self._run_gemini_voice_renderer())
++                        if provider == "chatgpt":
++                            tg.create_task(self._run_gemini_voice_renderer())
+@@
+                         if provider == "gemini":
++                            self._fallback_question_inflight = pending
++                            self._last_user_turn_text = pending
+                             await self.session.send_client_content(...)
+@@
++                if "jarvis_retry_gemini" in _err_low:
++                    self._conn_backoff = 0.15
++                    continue
+@@
++                _gemini_quota_error = any(k in _err_low for k in (
++                    "exceeded your current quota", "resource_exhausted",
++                    "quota exceeded", "rate limit exceeded", "too many requests", "429",
++                ))
++                if self._provider == "gemini" and (_gemini_quota_error or _auth_error):
++                    ttl = 86400.0 if _auth_error else 900.0
++                    self._gemini_blocked_until = time.time() + ttl
++                    pending = self._fallback_question_inflight or self._last_user_turn_text
++                    if pending:
++                        self._pending_fallback_text = pending
++                    self._fallback_question_inflight = ""
++                    self._conn_backoff = 0.15
++                    self.set_speaking(False)
++                    self._activity("RECONNECTING", "Gemini unavailable → local")
++                    continue
