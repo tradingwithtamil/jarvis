@@ -2,7 +2,7 @@ from chatgpt_history import search_history, stats
 
 PLUGIN = {
     "name": "chatgpt_history",
-    "description": "Search BOSS's locally imported ChatGPT conversation history by topic, title, date or keyword. Read-only.",
+    "description": "Search BOSS's imported ChatGPT archive plus live JARVIS OpenAI conversation history by topic, title, date or keyword. Read-only.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
