@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 import zipfile
+from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -152,8 +154,62 @@ def append_api_turn(
     with LIVE_API_PATH.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     return {"ok": True, "id": row["id"]}
+_TAMIL_MAP = {
+    "ஃப":"f","அ":"a","ஆ":"aa","இ":"i","ஈ":"i","உ":"u","ஊ":"u","எ":"e","ஏ":"e","ஐ":"ai","ஒ":"o","ஓ":"o","ஔ":"au",
+    "க":"k","ங":"ng","ச":"s","ஞ":"ny","ட":"d","ண":"n","த":"th","ந":"n","ப":"p","ம":"m","ய":"y","ர":"r","ல":"l",
+    "வ":"v","ழ":"zh","ள":"l","ற":"r","ன":"n","ஜ":"j","ஷ":"sh","ஸ":"s","ஹ":"h","ஃ":"",
+    "ா":"a","ி":"i","ீ":"i","ு":"u","ூ":"u","ெ":"e","ே":"e","ை":"ai","ொ":"o","ோ":"o","ௌ":"au","்":"",
+}
+_TELUGU_MAP = {
+    "అ":"a","ఆ":"aa","ఇ":"i","ఈ":"i","ఉ":"u","ఊ":"u","ఎ":"e","ఏ":"e","ఐ":"ai","ఒ":"o","ఓ":"o","ఔ":"au",
+    "క":"k","ఖ":"kh","గ":"g","ఘ":"gh","ఙ":"ng","చ":"ch","ఛ":"ch","జ":"j","ఝ":"jh","ఞ":"ny",
+    "ట":"t","ఠ":"th","డ":"d","ఢ":"dh","ణ":"n","త":"t","థ":"th","ద":"d","ధ":"dh","న":"n",
+    "ప":"p","ఫ":"f","బ":"b","భ":"bh","మ":"m","య":"y","ర":"r","ల":"l","వ":"v","శ":"sh","ష":"sh","స":"s","హ":"h","ళ":"l",
+    "ా":"a","ి":"i","ీ":"i","ు":"u","ూ":"u","ె":"e","ే":"e","ై":"ai","ొ":"o","ో":"o","ౌ":"au","్":"","ం":"n","ః":"h",
+}
+
+def _latinize(text: str) -> str:
+    value = str(text or "")
+    # Common Tamil loan-word digraphs first.
+    value = value.replace("ஃப", "f")
+    out = []
+    for ch in value:
+        if ch in _TAMIL_MAP:
+            out.append(_TAMIL_MAP[ch])
+        elif ch in _TELUGU_MAP:
+            out.append(_TELUGU_MAP[ch])
+        else:
+            out.append(ch)
+    value = "".join(out).lower()
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    # Phonetic cleanup for English loan words as captured by Indic STT.
+    value = value.replace("ph", "f").replace("pp", "p")
+    value = re.sub(r"[^a-z0-9@.+-]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
 def _norm(text: str) -> list[str]:
-    return re.findall(r"[\w@.+-]+", (text or "").lower(), flags=re.UNICODE)
+    raw = re.findall(r"[\w@.+-]+", (text or "").lower(), flags=re.UNICODE)
+    latin = re.findall(r"[a-z0-9@.+-]+", _latinize(text))
+    return raw + [t for t in latin if t not in raw]
+
+def _fuzzy_overlap(query_terms: set[str], hay_terms: set[str]) -> tuple[int, float]:
+    matched = 0
+    total = 0.0
+    for q in query_terms:
+        if len(q) < 3:
+            continue
+        best = 0.0
+        for h in hay_terms:
+            if len(h) < 3:
+                continue
+            ratio = SequenceMatcher(None, q, h).ratio()
+            if ratio > best:
+                best = ratio
+        if best >= 0.72:
+            matched += 1
+            total += best
+    return matched, total
 
 def _iter_rows():
     for path in (INDEX_PATH, LIVE_API_PATH):
@@ -169,6 +225,8 @@ def _iter_rows():
 
 def search_history(query: str, limit: int = 6) -> list[dict]:
     terms = set(_norm(query))
+    latin_terms = {t for t in _norm(_latinize(query)) if re.fullmatch(r"[a-z0-9@.+-]+", t)}
+    compare_terms = latin_terms or {t for t in terms if re.fullmatch(r"[a-z0-9@.+-]+", t)}
     if not terms:
         return []
     scored = []
@@ -177,18 +235,35 @@ def search_history(query: str, limit: int = 6) -> list[dict]:
         messages = row.get("messages") or []
         joined = "\n".join(str(m.get("text") or "") for m in messages)
         hay = set(_norm(title + " " + joined))
+        hay_latin = {t for t in _norm(_latinize(title + " " + joined)) if re.fullmatch(r"[a-z0-9@.+-]+", t)}
         overlap = len(terms & hay)
-        if not overlap:
+        fuzzy_count, fuzzy_total = _fuzzy_overlap(compare_terms, hay_latin)
+        if not overlap and not fuzzy_count:
             continue
         recent = row.get("update_time") or row.get("create_time") or ""
-        scored.append((overlap, recent, row))
+        score = overlap * 4.0 + fuzzy_count * 3.0 + fuzzy_total
+        joined_low = joined.lower()
+        # Do not let a previous failed history-search response outrank the
+        # actual conversation the user is trying to recover.
+        if "history" in joined_low and (
+            "no matching" in joined_low
+            or "matching-ah" in joined_low
+            or "matching ah" in joined_low
+        ):
+            score -= 20.0
+        if score <= 0:
+            continue
+        scored.append((score, recent, row))
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
     out = []
-    for _, _, row in scored[: max(1, min(int(limit or 6), 20))]:
+    for score, _, row in scored[: max(1, min(int(limit or 6), 20))]:
         snippets = []
         for message in row.get("messages") or []:
             text = str(message.get("text") or "")
-            if any(term in text.lower() for term in terms):
+            message_terms = set(_norm(_latinize(text)))
+            exact_here = bool(terms & set(_norm(text)))
+            fuzzy_here, _ = _fuzzy_overlap(compare_terms, message_terms)
+            if exact_here or fuzzy_here:
                 snippets.append({
                     "role": message.get("role"),
                     "text": text[:1200],
@@ -196,12 +271,29 @@ def search_history(query: str, limit: int = 6) -> list[dict]:
                 })
             if len(snippets) >= 3:
                 break
+        if snippets and not any(str(s.get("role") or "") == "assistant" for s in snippets):
+            for message in row.get("messages") or []:
+                if str(message.get("role") or "") == "assistant":
+                    snippets.append({
+                        "role": "assistant",
+                        "text": str(message.get("text") or "")[:1200],
+                        "create_time": message.get("create_time"),
+                    })
+                    break
+        if not snippets:
+            for message in (row.get("messages") or [])[:3]:
+                snippets.append({
+                    "role": message.get("role"),
+                    "text": str(message.get("text") or "")[:1200],
+                    "create_time": message.get("create_time"),
+                })
         out.append({
             "id": row.get("id"),
             "title": row.get("title"),
             "create_time": row.get("create_time"),
             "update_time": row.get("update_time"),
             "source": row.get("source"),
+            "match_score": round(float(score), 3),
             "snippets": snippets,
         })
     return out
