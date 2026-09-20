@@ -27,7 +27,7 @@ def request(method: str, path: str, payload=None, auth=True):
 
 def main(argv: list[str]) -> None:
     if not argv or argv[0] in {"help", "-h", "--help"}:
-        print("health | stats | recall <query> | remember <category> <key> <value> | forget <category> <key> | skills | skill-search <query> | skill <name>")
+        print("health | stats | recall <query> | remember <category> <key> <value> | forget <category> <key> | chat-history <query> | chat-history-stats | skills | skill-search <query> | skill <name>")
         return
     cmd = argv[0]
     if cmd == "health": out = request("GET", "/health", auth=False)
@@ -35,6 +35,8 @@ def main(argv: list[str]) -> None:
     elif cmd == "recall": out = request("POST", "/v1/memory/search", {"query": " ".join(argv[1:]), "limit": 8})
     elif cmd == "remember": out = request("POST", "/v1/memory/remember", {"category": argv[1], "key": argv[2], "value": " ".join(argv[3:]), "importance": 4})
     elif cmd == "forget": out = request("POST", "/v1/memory/forget", {"category": argv[1], "key": argv[2]})
+    elif cmd == "chat-history": out = request("POST", "/v1/chatgpt-history/search", {"query": " ".join(argv[1:]), "limit": 6})
+    elif cmd == "chat-history-stats": out = request("GET", "/v1/chatgpt-history/stats")
     elif cmd == "skills": out = request("GET", "/v1/skills")
     elif cmd == "skill-search": out = request("POST", "/v1/skills/search", {"query": " ".join(argv[1:]), "limit": 5})
     elif cmd == "skill": out = request("GET", f"/v1/skills/{argv[1]}")

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from memory.memory_manager import forget, memory_stats, remember, search_memory
 from skills.skill_manager import get_skill, list_skills, search_skills
+from chatgpt_history import search_history, stats as chatgpt_history_stats
 
 app = FastAPI(
     title="Jarvis ChatGPT Bridge",
@@ -49,6 +50,11 @@ class SkillSearch(BaseModel):
     limit: int = Field(default=5, ge=1, le=10)
 
 
+class ChatHistorySearch(BaseModel):
+    query: str = Field(min_length=1)
+    limit: int = Field(default=6, ge=1, le=20)
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "service": "jarvis-chatgpt-bridge", "version": "1.0.0"}
@@ -73,6 +79,16 @@ def save_memory_item(req: MemoryWrite):
 @app.post("/v1/memory/forget", dependencies=[Depends(_auth)])
 def delete_memory_item(req: MemoryDelete):
     return {"result": forget(req.key, req.category)}
+
+
+@app.get("/v1/chatgpt-history/stats", dependencies=[Depends(_auth)])
+def get_chatgpt_history_stats():
+    return chatgpt_history_stats()
+
+
+@app.post("/v1/chatgpt-history/search", dependencies=[Depends(_auth)])
+def find_chatgpt_history(req: ChatHistorySearch):
+    return {"results": search_history(req.query, req.limit)}
 
 
 @app.get("/v1/skills", dependencies=[Depends(_auth)])
