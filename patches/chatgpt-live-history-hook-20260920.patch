@@ -1,27 +1,32 @@
 --- a/main.py
 +++ b/main.py
 @@
- from core.openai_text_brain     import (
-     TEXT_MODEL, build_response_tools, create_response,
-     extract_output_text as extract_text_brain_output,
-     extract_function_calls as extract_text_brain_calls,
- )
  from skills.skill_manager       import format_skill_index_for_prompt, load_constitution_for_prompt
 +from chatgpt_history             import append_api_turn
 @@
-             if not calls:
-                 self._activity("READY", "Response prepared")
-                 answer = extract_text_brain_output(response)
+             self.ui.write_log(f"{self._asst_name}: {answer}")
+             self._session_log.append(f"{self._asst_name}: {answer}")
+             self._human.observe_assistant(answer)
++            try:
++                await asyncio.to_thread(
++                    append_api_turn,
++                    user_text,
++                    answer,
++                    session_id="jarvis-final-text",
++                )
++            except Exception as exc:
++                print(f"[ChatGPTHistory] Final text sync skipped: {exc}")
 @@
-                 self._vision_busy = False
-+                try:
-+                    await asyncio.to_thread(
-+                        append_api_turn,
-+                        user_text,
-+                        answer,
-+                        response_id=str(response.get("id") or ""),
-+                        session_id="jarvis-text-brain",
-+                    )
-+                except Exception as exc:
-+                    print(f"[ChatGPTHistory] Live sync skipped: {exc}")
-                 return answer.strip()
+                             if full_out:
+                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
+                                 self._session_log.append(f"{self._asst_name}: {full_out}")
+                                 self._human.observe_assistant(full_out)
++                                try:
++                                    await asyncio.to_thread(
++                                        append_api_turn,
++                                        self._last_user_turn_text,
++                                        full_out,
++                                        session_id=f"jarvis-{self._provider or 'fallback'}",
++                                    )
++                                except Exception as exc:
++                                    print(f"[ChatGPTHistory] Realtime sync skipped: {exc}")
