@@ -1,0 +1,10 @@
+const fs=require('fs'),crypto=require('crypto'),os=require('os');
+const deviceId=process.argv[2]||os.hostname().toLowerCase();
+const name=process.argv[3]||os.hostname();
+const relayUrl=process.argv[4]||'https://45-67-52-142.sslip.io/jarvis';
+const out=process.argv[5]||'C:/JarvisCommander/agent-config.json';
+const token=crypto.randomBytes(48).toString('base64url');
+const cfg={relayUrl,deviceId,name,allowedRoots:['C:\\'],pollSeconds:2,allowedTriggers:[],triggerDir:'C:\\JarvisCommander\\triggers',agentToken:token};
+fs.mkdirSync(require('path').dirname(out),{recursive:true});
+fs.writeFileSync(out,JSON.stringify(cfg,null,2));
+process.stdout.write(JSON.stringify({deviceId,name,platform:process.platform,tokenHash:crypto.createHash('sha256').update(token).digest('hex'),version:'0.1.1'}));
