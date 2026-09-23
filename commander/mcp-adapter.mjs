@@ -17,4 +17,4 @@ const server=http.createServer(async(req,res)=>{
     res.writeHead(r.status,oh);res.end(t);
   }catch(e){res.writeHead(502,{'content-type':'application/json'});res.end(JSON.stringify({error:String(e.message||e)}))}
 });
-server.listen(8794,'127.0.0.1',()=>console.error('Jarvis MCP compatibility adapter listening on 127.0.0.1:8794'));
+server.listen(8794,'127.0.0.1',()=>console.error('RD Commander MCP Adapter listening on 127.0.0.1:8794'));
