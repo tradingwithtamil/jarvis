@@ -1,7 +1,7 @@
 const fs=require('fs'),path=require('path'),os=require('os');
-const CONFIG=process.argv[2]||path.join(__dirname,'agent-config.json');let cfg=JSON.parse(fs.readFileSync(CONFIG,'utf8'));const VERSION='0.1.0',sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const CONFIG=process.argv[2]||path.join(__dirname,'agent-config.json');let cfg=JSON.parse(fs.readFileSync(CONFIG,'utf8'));const VERSION='0.1.1',sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const save=()=>{fs.writeFileSync(CONFIG+'.tmp',JSON.stringify(cfg,null,2));fs.renameSync(CONFIG+'.tmp',CONFIG)};
-const norm=p=>path.resolve(String(p||''));const allowed=p=>(cfg.allowedRoots||[]).some(r=>{const a=norm(r),b=norm(p);return b===a||b.startsWith(a+path.sep)});
+const norm=p=>path.resolve(String(p||''));const allowed=p=>(cfg.allowedRoots||[]).some(r=>{const a=norm(r),b=norm(p),prefix=a.endsWith(path.sep)?a:a+path.sep;return b===a||b.startsWith(prefix)});
 async function req(p,o){o=o||{};const h={'content-type':'application/json'};if(cfg.agentToken)h.authorization='Bearer '+cfg.agentToken;if(o.bootstrap)h['x-bootstrap-key']=cfg.bootstrapKey;const r=await fetch(cfg.relayUrl+p,{method:o.method||'GET',headers:h,body:o.body?JSON.stringify(o.body):undefined,signal:AbortSignal.timeout(o.timeout||20000)});const t=await r.text();let j={};try{j=JSON.parse(t)}catch{j={raw:t}}if(!r.ok)throw Error(r.status+' '+(j.error||t));return j}
 async function register(){const b={deviceId:cfg.deviceId,name:cfg.name||os.hostname(),platform:process.platform,version:VERSION,meta:{arch:process.arch,release:os.release()}};const j=await req('/agent/register',{method:'POST',bootstrap:true,body:b});cfg.agentToken=j.agentToken;delete cfg.bootstrapKey;save()}
 function diskInfo(){const roots=cfg.allowedRoots||[];return roots.map(r=>{try{const s=fs.statfsSync(r);return{root:r,total:s.blocks*s.bsize,free:s.bavail*s.bsize}}catch(e){return{root:r,error:e.message}}})}
