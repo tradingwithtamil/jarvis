@@ -1,7 +1,7 @@
 const http=require('http'),fs=require('fs'),crypto=require('crypto'),path=require('path');
 const ROOT=__dirname,cfg=JSON.parse(fs.readFileSync(path.join(ROOT,'config.json'),'utf8')),STATE=path.join(ROOT,'state.json');
 let state={devices:{},commands:{}};try{state=JSON.parse(fs.readFileSync(STATE,'utf8'))}catch{}
-const persist=()=>{fs.writeFileSync(STATE+'.tmp',JSON.stringify(state,null,2));fs.renameSync(STATE+'.tmp',STATE)};
+const persist=()=>{fs.writeFileSync(STATE,JSON.stringify(state,null,2),'utf8')};
 const H=s=>crypto.createHash('sha256').update(String(s)).digest('hex');
 const same=(a,b)=>{a=Buffer.from(String(a||''));b=Buffer.from(String(b||''));return a.length===b.length&&crypto.timingSafeEqual(a,b)};
 const send=(res,n,o)=>{const x=JSON.stringify(o);res.writeHead(n,{'content-type':'application/json','content-length':Buffer.byteLength(x)});res.end(x)};
@@ -22,7 +22,7 @@ const tools=[
 {name:'trigger_action',description:'Trigger a pre-approved local maintenance action by name.',inputSchema:{type:'object',properties:{device_id:{type:'string'},name:{type:'string'}},required:['device_id','name']}}
 ];
 async function mcp(req,res,u){if(!admin(req,u))return send(res,401,{error:'unauthorized'});const m=await read(req);if(!m.id&&m.method)return send(res,202,{});
-let result;if(m.method==='initialize')result={protocolVersion:m.params&&m.params.protocolVersion||'2025-06-18',capabilities:{tools:{}},serverInfo:{name:'Jarvis Commander',version:'0.1.1'}};
+let result;if(m.method==='initialize')result={protocolVersion:m.params&&m.params.protocolVersion||'2025-06-18',capabilities:{tools:{}},serverInfo:{name:'Jarvis Commander',version:'0.1.2'}};
 else if(m.method==='tools/list')result={tools:tools};
 else if(m.method==='tools/call'){const n=m.params&&m.params.name,a=m.params&&m.params.arguments||{};if(n==='list_devices')result={content:[{type:'text',text:JSON.stringify(devices(),null,2)}]};
 else{const map={read_file:'read_file',write_file:'write_file',list_directory:'list_dir',system_status:'system_status',http_check:'http_check',trigger_action:'trigger'},act=map[n];
@@ -31,7 +31,7 @@ if(!state.devices[a.device_id])result={content:[{type:'text',text:'unknown devic
 else{const c=queue(a.device_id,act,a),o=await wait(c.id,60000);result={content:[{type:'text',text:JSON.stringify(o,null,2)}],isError:!o.ok}}}}
 else return send(res,200,{jsonrpc:'2.0',id:m.id,error:{code:-32601,message:'method not found'}});send(res,200,{jsonrpc:'2.0',id:m.id,result:result})}
 http.createServer(async(req,res)=>{try{const u=new URL(req.url,'http://x');
-if(req.method==='GET'&&u.pathname==='/health')return send(res,200,{ok:true,name:'Jarvis Commander Relay',version:'0.1.1',devices:devices().length});
+if(req.method==='GET'&&u.pathname==='/health')return send(res,200,{ok:true,name:'Jarvis Commander Relay',version:'0.1.2',devices:devices().length});
 if(req.method==='POST'&&u.pathname==='/agent/register'){if(!cfg.bootstrapEnabled||!same(req.headers['x-bootstrap-key'],cfg.bootstrapSecret))return send(res,403,{error:'registration disabled'});const b=await read(req);if(!b.deviceId||!b.name)return send(res,400,{error:'missing fields'});const tok=crypto.randomBytes(48).toString('base64url');state.devices[b.deviceId]={deviceId:b.deviceId,name:b.name,platform:b.platform,version:b.version,tokenHash:H(tok),registeredAt:new Date().toISOString(),lastSeen:new Date().toISOString(),meta:b.meta||{}};persist();return send(res,200,{ok:true,agentToken:tok})}
 if(req.method==='POST'&&u.pathname==='/agent/heartbeat'){const b=await read(req);if(!agent(req,b.deviceId))return send(res,401,{error:'unauthorized'});Object.assign(state.devices[b.deviceId],{lastSeen:new Date().toISOString(),version:b.version,meta:b.meta||{}});persist();return send(res,200,{ok:true})}
 if(req.method==='GET'&&u.pathname==='/agent/poll'){const id=u.searchParams.get('deviceId');if(!agent(req,id))return send(res,401,{error:'unauthorized'});const now=Date.now();for(const c of Object.values(state.commands))if(c.deviceId===id&&c.status==='dispatched'&&now-new Date(c.dispatchedAt).getTime()>120000)c.status='queued';const c=Object.values(state.commands).find(x=>x.deviceId===id&&x.status==='queued');if(!c)return send(res,200,{command:null});c.status='dispatched';c.dispatchedAt=new Date().toISOString();persist();return send(res,200,{command:c})}
