@@ -3,8 +3,8 @@ $ErrorActionPreference='Stop'
 $Root='C:\RDCommander'
 $EnrollBase='https://45-67-52-142.sslip.io/rd'
 $RelayBase='https://45-67-52-142.sslip.io/jarvis'
-$AgentUrl='https://raw.githubusercontent.com/tradingwithtamil/jarvis/6600b2b924c4a83a4c4cdedf96dcbca3c7c5015f/commander/agent-safe.js'
-$AgentSha256='653ba6119bb6ca1a48940e06eede8d9739f61ca3b7f213cb7e5ae2d1c76eece4'
+$AgentUrl='https://raw.githubusercontent.com/tradingwithtamil/jarvis/d99adc97dfa5f6a24cfefab9052358674117785a/commander/agent-v2.js'
+$AgentSha256='8903d6bf35ca4f0b3885cb90c3ce8626197472c59d1dc45d1a2f8b7f23bb8620'
 
 function Assert-Admin {
   $p=New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -42,7 +42,7 @@ $approved=$null
 for($i=0;$i -lt 200;$i++){Start-Sleep -Seconds 3;try{$s=Invoke-RestMethod -Uri ($EnrollBase+'/device/status?claim='+[uri]::EscapeDataString($enroll.claim));if($s.state -eq 'approved'){$approved=$s;break}}catch{}}
 if(-not $approved -or -not $approved.agentToken){throw 'RD Commander approval timed out'}
 $nodeExe=Ensure-Node22
-$agentPath=Join-Path $Root 'agent-safe.js'; Invoke-WebRequest -UseBasicParsing -Uri $AgentUrl -OutFile $agentPath
+$agentPath=Join-Path $Root 'agent-v2.js'; Invoke-WebRequest -UseBasicParsing -Uri $AgentUrl -OutFile $agentPath
 $actual=(Get-FileHash -Algorithm SHA256 $agentPath).Hash.ToLowerInvariant(); if($actual -ne $AgentSha256){Remove-Item $agentPath -Force;throw 'RD Commander agent SHA256 mismatch'}
 $roots=@(Get-PSDrive -PSProvider FileSystem|Where-Object {$_.Root -match '^[A-Za-z]:\\$'}|ForEach-Object {$_.Root})
 $cfg=[ordered]@{relayUrl=$approved.relayUrl;deviceId=$deviceId;name=$name;agentToken=$approved.agentToken;allowedRoots=$roots;allowedTriggers=@();pollSeconds=2}
@@ -54,8 +54,8 @@ $ErrorActionPreference='Continue'
 $Root='C:\RDCommander'; $StatusRoot='C:\Sentinel\RDCommander'; New-Item -ItemType Directory -Force -Path $StatusRoot|Out-Null
 function Log($m){Add-Content -LiteralPath (Join-Path $StatusRoot 'watchdog.log') -Value ((Get-Date -Format s)+' '+$m)}
 while($true){
-  $p=Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue|Where-Object {$_.CommandLine -match 'RDCommander.*agent-safe\.js'}|Select-Object -First 1
-  if(-not $p){Log 'agent missing; restarting task'; Start-ScheduledTask -TaskName 'RDCommanderAgent' -ErrorAction SilentlyContinue; Start-Sleep 5; $p=Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue|Where-Object {$_.CommandLine -match 'RDCommander.*agent-safe\.js'}|Select-Object -First 1}
+  $p=Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue|Where-Object {$_.CommandLine -match 'RDCommander.*agent-(?:v2|safe)\.js'}|Select-Object -First 1
+  if(-not $p){Log 'agent missing; restarting task'; Start-ScheduledTask -TaskName 'RDCommanderAgent' -ErrorAction SilentlyContinue; Start-Sleep 5; $p=Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue|Where-Object {$_.CommandLine -match 'RDCommander.*agent-(?:v2|safe)\.js'}|Select-Object -First 1}
   $status=[ordered]@{time=(Get-Date).ToUniversalTime().ToString('o');agentRunning=[bool]$p;pid=if($p){$p.ProcessId}else{$null}}|ConvertTo-Json -Compress
   Set-Content -LiteralPath (Join-Path $StatusRoot 'status.json') -Value $status -Encoding UTF8; Start-Sleep 15
 }
