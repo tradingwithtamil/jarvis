@@ -8,7 +8,7 @@ const send=(res,n,o)=>{const x=JSON.stringify(o);res.writeHead(n,{'content-type'
 const read=async req=>{let s='';for await(const c of req){s+=c;if(s.length>2000000)throw Error('body too large')}return s?JSON.parse(s):{}};
 const admin=(req,u)=>same((req.headers.authorization||'').replace(/^Bearer\s+/i,''),cfg.adminToken)||same(u.searchParams.get('token'),cfg.adminToken);
 const agent=(req,id)=>state.devices[id]&&same(H((req.headers.authorization||'').replace(/^Bearer\s+/i,'')),state.devices[id].tokenHash);
-const safeActions=new Set(['read_file','write_file','list_dir','system_status','http_check','trigger']);
+const safeActions=new Set(['read_file','write_file','list_dir','system_status','http_check','trigger','execute_command']);
 function devices(){const n=Date.now();return Object.values(state.devices).map(d=>({deviceId:d.deviceId,name:d.name,platform:d.platform,version:d.version,status:d.lastSeen&&n-new Date(d.lastSeen).getTime()<45000?'online':'offline',lastSeen:d.lastSeen,meta:d.meta||{}}))}
 function queue(deviceId,action,args){if(!safeActions.has(action))throw Error('action not allowed');const id=crypto.randomUUID();state.commands[id]={id,deviceId,action,args:args||{},status:'queued',createdAt:new Date().toISOString()};persist();return state.commands[id]}
 function wait(id,ms){return new Promise(ok=>{const s=Date.now(),t=setInterval(()=>{const c=state.commands[id];if(!c){clearInterval(t);return ok({ok:false,error:'missing command'})}if(c.status==='done'||c.status==='error'){clearInterval(t);return ok(Object.assign({ok:c.status==='done'},c))}if(Date.now()-s>ms){clearInterval(t);ok({ok:false,id,status:c.status,error:'timeout'})}},250)})}
@@ -19,13 +19,14 @@ const tools=[
 {name:'list_directory',description:'List an allowlisted local directory.',inputSchema:{type:'object',properties:{device_id:{type:'string'},path:{type:'string'}},required:['device_id','path']}},
 {name:'system_status',description:'Get OS, RAM, uptime and disk status.',inputSchema:{type:'object',properties:{device_id:{type:'string'}},required:['device_id']}},
 {name:'http_check',description:'Check an HTTP or HTTPS endpoint from the selected device.',inputSchema:{type:'object',properties:{device_id:{type:'string'},url:{type:'string'},timeout_ms:{type:'integer'}},required:['device_id','url']}},
-{name:'trigger_action',description:'Trigger a pre-approved local maintenance action by name.',inputSchema:{type:'object',properties:{device_id:{type:'string'},name:{type:'string'}},required:['device_id','name']}}
+{name:'trigger_action',description:'Trigger a pre-approved local maintenance action by name.',inputSchema:{type:'object',properties:{device_id:{type:'string'},name:{type:'string'}},required:['device_id','name']}},
+{name:'execute_command',description:'Execute an administrator-authorized maintenance command on the selected RD Commander device.',inputSchema:{type:'object',properties:{device_id:{type:'string'},command:{type:'string'},shell:{type:'string'},timeout_ms:{type:'integer'}},required:['device_id','command']}}
 ];
 async function mcp(req,res,u){if(!admin(req,u))return send(res,401,{error:'unauthorized'});const m=await read(req);if(!m.id&&m.method)return send(res,202,{});
 let result;if(m.method==='initialize')result={protocolVersion:m.params&&m.params.protocolVersion||'2025-06-18',capabilities:{tools:{}},serverInfo:{name:'RD Commander',version:'0.1.3'}};
 else if(m.method==='tools/list')result={tools:tools};
 else if(m.method==='tools/call'){const n=m.params&&m.params.name,a=m.params&&m.params.arguments||{};if(n==='list_devices')result={content:[{type:'text',text:JSON.stringify(devices(),null,2)}]};
-else{const map={read_file:'read_file',write_file:'write_file',list_directory:'list_dir',system_status:'system_status',http_check:'http_check',trigger_action:'trigger'},act=map[n];
+else{const map={read_file:'read_file',write_file:'write_file',list_directory:'list_dir',system_status:'system_status',http_check:'http_check',trigger_action:'trigger',execute_command:'execute_command'},act=map[n];
 if(!act)return send(res,200,{jsonrpc:'2.0',id:m.id,error:{code:-32601,message:'unknown tool'}});
 if(!state.devices[a.device_id])result={content:[{type:'text',text:'unknown device'}],isError:true};
 else{const c=queue(a.device_id,act,a),o=await wait(c.id,60000);result={content:[{type:'text',text:JSON.stringify(o,null,2)}],isError:!o.ok}}}}
