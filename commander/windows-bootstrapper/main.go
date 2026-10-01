@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	appVersion   = "1.0.0"
-	installerURL = "https://raw.githubusercontent.com/tradingwithtamil/jarvis/a6a728a01be3fb3c93a7b9a358f849dd416ce1bb/commander/install-rd-windows.ps1"
-	installerSHA = "a764da060c5ed16698ceb7a2a51b9b058ab4982a45d6cc46250490d1dd0c084f"
+	appVersion   = "1.1.0"
+	installerURL = "https://raw.githubusercontent.com/tradingwithtamil/jarvis/19980ed63c03237b244e4e120770b2a2768c0442/commander/install-rd-windows.ps1"
+	installerSHA = "cf07a009f4048485cddb1323ea0bdf6d849ed7b9b5f3b08ede899a558a38eada"
 )
 
 func isAdmin() bool {
